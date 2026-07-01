@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -pedantic -MMD -MP -Iinclude
 
-SRCS = src/main.c
+SRCS = $(wildcard src/*.c)
 
 BUILD_DIR = build
 TARGET = $(BUILD_DIR)/main
@@ -21,7 +21,7 @@ $(TARGET): $(OBJ)
 	$(CC) $(OBJ) -o $(TARGET)
 
 run: $(TARGET)
-	./$(TARGET)
+	./$(TARGET) $(ARGS)
 
 clean:
 	rm -rf $(BUILD_DIR)
