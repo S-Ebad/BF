@@ -98,6 +98,7 @@ bool parse(Lexer *lex, Bytecode *out) {
 
       stack_push(&jmps, len);
       break;
+
     case ']': {
       // mismatching brackets
       if (jmps.len == 0) {
@@ -106,7 +107,7 @@ bool parse(Lexer *lex, Bytecode *out) {
       }
 
       size_t open = stack_pop(&jmps);
-      ops[open].data.jump = len + 1;
+      ops[open].data.jump = len - open + 1;
 
       opcode->kind = OP_JNZ;
       opcode->data.jump = len - open;

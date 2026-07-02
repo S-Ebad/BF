@@ -1,5 +1,6 @@
 #include "lexer.h"
 #include "parser.h"
+#include "vm.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,17 +74,12 @@ int main(int argc, char **argv) {
 
   Bytecode bytecode;
 
-  if(!parse(&lex, &bytecode)) {
+  if (!parse(&lex, &bytecode)) {
     return 1;
   }
 
-  printf("Bytecode{ .ops=%p, .len=%zu }\n",
-      (void *)bytecode.ops, bytecode.len);
-  for (size_t i = 0; i < bytecode.len; i++) {
-    Op *opcode = bytecode.ops + i;
+  vm(&bytecode);
 
-    fprintf(stdout, "%s\n", op_to_str(opcode));
-  }
-
+  free(bytecode.ops);
   free(buf);
 }

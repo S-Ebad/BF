@@ -21,7 +21,7 @@ typedef struct Op {
     size_t jump;
   } data;
 } Op;
-
+// 16 * 11.4k
 typedef struct Bytecode {
   Op *ops;
   size_t len;
