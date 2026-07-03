@@ -1,4 +1,5 @@
 #include "lexer.h"
+#include "optimize.h"
 #include "parser.h"
 #include "vm.h"
 #include <stdio.h>
@@ -69,17 +70,20 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  Lexer lex;
-  lexer_init(&lex, buf, len);
-
   Bytecode bytecode;
+  {
+    Lexer lex;
+    lexer_init(&lex, buf, len);
 
-  if (!parse(&lex, &bytecode)) {
-    return 1;
+    if (!parse(&lex, &bytecode)) {
+      return 1;
+    }
+
+    free(buf);
   }
 
-  vm(&bytecode);
+  optimize(&bytecode);
 
+  // vm(&bytecode);
   free(bytecode.ops);
-  free(buf);
 }

@@ -5,4 +5,4 @@ struct Bytecode;
 
 void optimize(struct Bytecode *bytecode);
 
-#endif // !OPTIMIZE_H
+#endif
