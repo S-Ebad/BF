@@ -1,3 +1,8 @@
+use crate::lexer::Lexer;
+
+mod lexer;
+
 fn main() {
-    println!("Hello, world!");
+    let lexer = Lexer::tokenize("[+++--]");
+    dbg!(lexer);
 }
