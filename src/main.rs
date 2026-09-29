@@ -1,8 +1,11 @@
-use crate::lexer::Lexer;
+use crate::{lexer::tokenize, resolver::resolve_jumps};
 
 mod lexer;
+mod resolver;
 
 fn main() {
-    let lexer = Lexer::tokenize("[+++--]");
-    dbg!(lexer);
+    let mut tokens = tokenize("-[++]+");
+    resolve_jumps(&mut tokens);
+
+    dbg!(&tokens);
 }

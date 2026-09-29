@@ -4,40 +4,41 @@ pub enum TokenKind {
     Sub,
     RMove,
     LMove,
-    Output, // output
-    Input,  // Input
-    JmpZ,
-    JmpNZ,
+    Output,
+    Input,
+    JmpZ(usize),
+    JmpNZ(usize),
 }
 
+#[allow(unused)]
 #[derive(Debug)]
 pub struct Span(usize);
 
+#[allow(unused)]
 #[derive(Debug)]
 pub struct Token {
     kind: TokenKind,
     span: Span,
 }
 
-#[derive(Debug)]
-pub struct Lexer {
-    tokens: Vec<Token>,
-}
-
-impl Span {
-    fn new(pos: usize) -> Self {
-        Self(pos)
-    }
-}
-
 impl Token {
     fn new(kind: TokenKind, span: Span) -> Self {
         Self { kind, span }
     }
+
+    #[allow(unused)]
+    pub fn kind(&self) -> &TokenKind {
+        &self.kind
+    }
+
+    #[allow(unused)]
+    pub fn kind_mut(&mut self) -> &mut TokenKind {
+        &mut self.kind
+    }
 }
 
 impl TokenKind {
-    fn new(c: char) -> Option<Self> {
+    fn from_char(c: char) -> Option<Self> {
         match c {
             '+' => Some(Self::Add),
             '-' => Some(Self::Sub),
@@ -45,26 +46,15 @@ impl TokenKind {
             '<' => Some(Self::LMove),
             '.' => Some(Self::Output),
             ',' => Some(Self::Input),
-            '[' => Some(Self::JmpZ),
-            ']' => Some(Self::JmpNZ),
+            '[' => Some(Self::JmpZ(0)),
+            ']' => Some(Self::JmpNZ(0)),
             _ => None,
         }
     }
 }
 
-impl Lexer {
-    pub fn tokenize(expr: &str) -> Lexer {
-        let mut tokens: Vec<Token> = vec![];
-
-        for (size, c) in expr.char_indices() {
-            if let Some(kind) = TokenKind::new(c) {
-                let span = Span::new(size);
-
-                let token = Token::new(kind, span);
-                tokens.push(token);
-            }
-        }
-
-        Lexer { tokens }
-    }
+pub fn tokenize(expr: &str) -> Vec<Token> {
+    expr.char_indices()
+        .filter_map(|(i, c)| TokenKind::from_char(c).map(|k| Token::new(k, Span(i))))
+        .collect()
 }
