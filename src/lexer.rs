@@ -1,3 +1,5 @@
+use crate::errors::Span;
+
 #[derive(Debug)]
 pub enum TokenKind {
     Add,
@@ -10,11 +12,6 @@ pub enum TokenKind {
     JmpNZ(usize),
 }
 
-#[allow(unused)]
-#[derive(Debug)]
-pub struct Span(usize);
-
-#[allow(unused)]
 #[derive(Debug)]
 pub struct Token {
     kind: TokenKind,
@@ -26,14 +23,16 @@ impl Token {
         Self { kind, span }
     }
 
-    #[allow(unused)]
     pub fn kind(&self) -> &TokenKind {
         &self.kind
     }
 
-    #[allow(unused)]
     pub fn kind_mut(&mut self) -> &mut TokenKind {
         &mut self.kind
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
     }
 }
 
@@ -55,6 +54,6 @@ impl TokenKind {
 
 pub fn tokenize(expr: &str) -> Vec<Token> {
     expr.char_indices()
-        .filter_map(|(i, c)| TokenKind::from_char(c).map(|k| Token::new(k, Span(i))))
+        .filter_map(|(i, c)| TokenKind::from_char(c).map(|k| Token::new(k, Span::new(i))))
         .collect()
 }
