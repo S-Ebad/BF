@@ -4,6 +4,7 @@ use unicode_width::UnicodeWidthChar;
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 pub struct Span(usize);
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum BFError {
     UnmatchedOpenBracket(Span),
     UnmatchedCloseBracket(Span),
@@ -42,11 +43,21 @@ fn display_width(c: char) -> usize {
     }
 }
 
-fn render_error(source: &str, error: &BFError) {
-    const MAX_WIDTH: usize = 60;
+const MAX_WIDTH: usize = 60;
 
-    let span = error.span();
+/// The part of a source line shown under an error, with tabs already expanded.
+#[derive(Debug)]
+struct Snippet {
+    line: usize,
+    column: usize,
+    text: String,
+    /// Display column of the caret within `text`.
+    caret: usize,
+    cut_start: bool,
+    cut_end: bool,
+}
 
+fn snippet(source: &str, span: Span) -> Snippet {
     let pos = span.0;
 
     let line = source[..pos].bytes().filter(|&b| b == b'\n').count() + 1;
@@ -87,23 +98,44 @@ fn render_error(source: &str, error: &BFError) {
         (start, end)
     };
 
-    let prefix = if start > 0 { "..." } else { "" };
-    let suffix = if end < chars.len() { "..." } else { "" };
-    let snippet: String = chars[start..end]
+    let text = chars[start..end]
         .iter()
         .map(|&c| match c {
             '\t' => " ".repeat(TAB_WIDTH),
             c => c.to_string(),
         })
         .collect();
-    let caret_pad = prefix.len() + widths[start..col0].iter().sum::<usize>();
+
+    Snippet {
+        line,
+        column,
+        text,
+        caret: widths[start..col0].iter().sum(),
+        cut_start: start > 0,
+        cut_end: end < chars.len(),
+    }
+}
+
+fn render_error(source: &str, error: &BFError) {
+    let Snippet {
+        line,
+        column,
+        text,
+        caret,
+        cut_start,
+        cut_end,
+    } = snippet(source, error.span());
+
+    let prefix = if cut_start { "..." } else { "" };
+    let suffix = if cut_end { "..." } else { "" };
+    let caret_pad = prefix.len() + caret;
 
     let width = line.to_string().len();
     let gutter = " ".repeat(width);
 
     eprintln!("error: {error} at line {line}, column {column}");
     eprintln!("{gutter} |");
-    eprintln!("{line:>width$} | {prefix}{snippet}{suffix}");
+    eprintln!("{line:>width$} | {prefix}{text}{suffix}");
     eprintln!("{gutter} | {}^", " ".repeat(caret_pad));
 }
 
