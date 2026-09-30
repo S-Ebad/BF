@@ -1,4 +1,5 @@
 use std::fmt;
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 pub struct Span(usize);
@@ -31,6 +32,16 @@ impl fmt::Display for BFError {
     }
 }
 
+const TAB_WIDTH: usize = 4;
+
+/// Terminal columns a char takes up in the snippet (tabs are expanded to spaces).
+fn display_width(c: char) -> usize {
+    match c {
+        '\t' => TAB_WIDTH,
+        c => c.width().unwrap_or(0),
+    }
+}
+
 fn render_error(source: &str, error: &BFError) {
     const MAX_WIDTH: usize = 60;
 
@@ -47,19 +58,45 @@ fn render_error(source: &str, error: &BFError) {
 
     let chars: Vec<char> = line_text.chars().collect();
     let col0 = column - 1;
-    let (start, end) = if chars.len() <= MAX_WIDTH {
+    let widths: Vec<usize> = chars.iter().map(|&c| display_width(c)).collect();
+
+    // Pick a window of at most MAX_WIDTH columns, centred on the error when possible.
+    let (start, end) = if widths.iter().sum::<usize>() <= MAX_WIDTH {
         (0, chars.len())
     } else {
-        let start = col0
-            .saturating_sub(MAX_WIDTH / 2)
-            .min(chars.len() - MAX_WIDTH);
-        (start, start + MAX_WIDTH)
+        let mut start = col0;
+        let mut used = 0;
+        while start > 0 && used + widths[start - 1] <= MAX_WIDTH / 2 {
+            start -= 1;
+            used += widths[start];
+        }
+
+        let mut end = start;
+        let mut used = 0;
+        while end < chars.len() && used + widths[end] <= MAX_WIDTH {
+            used += widths[end];
+            end += 1;
+        }
+
+        // Near the end of the line: spend the leftover columns on the left.
+        while start > 0 && used + widths[start - 1] <= MAX_WIDTH {
+            start -= 1;
+            used += widths[start];
+        }
+
+        (start, end)
     };
 
     let prefix = if start > 0 { "..." } else { "" };
     let suffix = if end < chars.len() { "..." } else { "" };
-    let snippet: String = chars[start..end].iter().collect();
-    let caret_pad = prefix.len() + (col0 - start);
+    let snippet: String = chars[start..end]
+        .iter()
+        .map(|&c| match c {
+            '\t' => " ".repeat(TAB_WIDTH),
+            c => c.to_string(),
+        })
+        .collect();
+    let caret_pad = prefix.len() + widths[start..col0].iter().sum::<usize>();
 
     let width = line.to_string().len();
     let gutter = " ".repeat(width);
