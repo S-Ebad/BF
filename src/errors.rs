@@ -145,3 +145,6 @@ pub fn report(source: &str, errors: Vec<BFError>) {
         eprintln!();
     }
 }
+
+#[cfg(test)]
+mod tests;
