@@ -31,12 +31,10 @@ impl fmt::Display for BFError {
     }
 }
 
-pub fn render_error(source: &str, error: &BFError) {
+fn render_error(source: &str, error: &BFError) {
     const MAX_WIDTH: usize = 60;
 
-    let span = match error {
-        BFError::UnmatchedOpenBracket(span) | BFError::UnmatchedCloseBracket(span) => span,
-    };
+    let span = error.span();
 
     let pos = span.0;
 
@@ -70,4 +68,11 @@ pub fn render_error(source: &str, error: &BFError) {
     eprintln!("{gutter} |");
     eprintln!("{line:>width$} | {prefix}{snippet}{suffix}");
     eprintln!("{gutter} | {}^", " ".repeat(caret_pad));
+}
+
+pub fn report(source: &str, errors: Vec<BFError>) {
+    for err in errors {
+        render_error(source, &err);
+        eprintln!();
+    }
 }

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
@@ -20,9 +21,35 @@ pub struct Config {
     pub opt: u8,
 }
 
+impl Config {
+    /// The output path: -o if given, otherwise the default for --emit.
+    pub fn output(&self) -> PathBuf {
+        self.output
+            .clone()
+            .unwrap_or_else(|| self.emit.default_output().into())
+    }
+
+    /// Reads the input file, with the path in the error.
+    pub fn read_source(&self) -> anyhow::Result<String> {
+        std::fs::read_to_string(&self.input)
+            .with_context(|| format!("couldn't read `{}`", self.input.display()))
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 pub enum Emit {
     Asm,
     Obj,
     Exe,
+}
+
+impl Emit {
+    /// The file name used when -o isn't given.
+    pub fn default_output(self) -> &'static str {
+        match self {
+            Emit::Asm => "a.asm",
+            Emit::Obj => "a.o",
+            Emit::Exe => "a.out",
+        }
+    }
 }
