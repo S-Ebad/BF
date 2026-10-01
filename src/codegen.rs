@@ -20,17 +20,46 @@ fn label(out: &mut String, name: &str) {
     writeln!(out, "{name}:").unwrap();
 }
 
+/// The memory operand for the cell at `offset` from the pointer.
+fn cell(offset: isize) -> String {
+    match offset {
+        0 => "byte [rbx]".to_string(),
+        _ => format!("byte [rbx{offset:+}]"),
+    }
+}
+
+/// Adds `n` to the cell at `offset`. Sets the zero flag from the result.
+fn add_cell(out: &mut String, offset: isize, n: u8) {
+    let cell = cell(offset);
+
+    match n {
+        1 => instr(out, &format!("inc {cell}")),
+        u8::MAX => instr(out, &format!("dec {cell}")),
+        _ => instr(out, &format!("add {cell}, {n}")),
+    }
+}
+
+/// Moves the pointer by `n` cells.
+fn move_ptr(out: &mut String, n: isize) {
+    match n {
+        1 => instr(out, "inc rbx"),
+        -1 => instr(out, "dec rbx"),
+        n if n > 0 => instr(out, &format!("add rbx, {n}")),
+        n => instr(out, &format!("sub rbx, {}", n.unsigned_abs())),
+    }
+}
+
+/// `putc` appends `cl` to the output buffer, flushing it when full.
 fn create_putc(out: &mut String) {
     label(out, "putc");
     instr(out, "lea rax, [rel outbuf]");
-    instr(out, "mov cl, [rbx]");
     instr(out, "mov [rax + r12], cl");
     instr(out, "inc r12");
     instr(out, "cmp r12, 4096");
     instr(out, "je flush");
     instr(out, "ret");
 
-    label(out, "flush"); // flush label
+    label(out, "flush");
     instr(out, "test r12, r12");
     instr(out, "jz .done");
     instr(out, "mov eax, 1");
@@ -43,9 +72,7 @@ fn create_putc(out: &mut String) {
     instr(out, "ret");
 }
 
-//Code generation
 pub fn generate(tokens: &[Token]) -> String {
-    // initial code generation
     let mut out = String::from(INITIAL);
     create_putc(&mut out);
 
@@ -53,27 +80,52 @@ pub fn generate(tokens: &[Token]) -> String {
     instr(&mut out, "lea rbx, [rel tape]");
     instr(&mut out, "xor r12d, r12d");
 
-    for token in tokens {
-        match token.kind() {
-            TokenKind::Add(1) => instr(&mut out, "inc byte [rbx]"),
-            TokenKind::Add(u8::MAX) => instr(&mut out, "dec byte [rbx]"),
-            TokenKind::Add(n) => instr(&mut out, &format!("add byte [rbx], {n}")),
+    let mut scans = 0;
 
-            TokenKind::Move(1) => instr(&mut out, "inc rbx"),
-            TokenKind::Move(-1) => instr(&mut out, "dec rbx"),
-            TokenKind::Move(n) if *n > 0 => instr(&mut out, &format!("add rbx, {n}")),
-            TokenKind::Move(n) => instr(&mut out, &format!("sub rbx, {}", n.unsigned_abs())),
+    for token in tokens {
+        match *token.kind() {
+            TokenKind::Add(n) => add_cell(&mut out, 0, n),
+            TokenKind::AddAt(offset, n) => add_cell(&mut out, offset, n),
+            TokenKind::Move(n) => move_ptr(&mut out, n),
+            TokenKind::Set(offset, n) => instr(&mut out, &format!("mov {}, {n}", cell(offset))),
+
+            TokenKind::MulAt(offset, factor) => {
+                instr(&mut out, "movzx eax, byte [rbx]");
+                match factor {
+                    1 => instr(&mut out, &format!("add {}, al", cell(offset))),
+                    u8::MAX => instr(&mut out, &format!("sub {}, al", cell(offset))),
+                    _ => {
+                        instr(&mut out, &format!("imul eax, eax, {factor}"));
+                        instr(&mut out, &format!("add {}, al", cell(offset)));
+                    }
+                }
+            }
+
+            // Laid out like a loop: check once on entry, then step and check at the bottom.
+            TokenKind::Scan(step) => {
+                instr(&mut out, "cmp byte [rbx], 0");
+                instr(&mut out, &format!("je .scan_end_{scans}"));
+                label(&mut out, &format!(".scan_{scans}"));
+                move_ptr(&mut out, step);
+                instr(&mut out, "cmp byte [rbx], 0");
+                instr(&mut out, &format!("jne .scan_{scans}"));
+                label(&mut out, &format!(".scan_end_{scans}"));
+                scans += 1;
+            }
 
             TokenKind::JmpZ(n) => {
-                label(&mut out, &format!(".loop_{}", n));
-                instr(&mut out, &format!("cmp byte [rbx], 0\n  je .end_{}", n));
+                label(&mut out, &format!(".loop_{n}"));
+                instr(&mut out, "cmp byte [rbx], 0");
+                instr(&mut out, &format!("je .end_{n}"));
             }
             TokenKind::JmpNZ(n) => {
-                instr(&mut out, &format!("cmp byte [rbx], 0\n  jne .loop_{}", n));
-                label(&mut out, &format!(".end_{}", n));
+                instr(&mut out, "cmp byte [rbx], 0");
+                instr(&mut out, &format!("jne .loop_{n}"));
+                label(&mut out, &format!(".end_{n}"));
             }
 
-            TokenKind::Output => {
+            TokenKind::Output(offset) => {
+                instr(&mut out, &format!("mov cl, {}", cell(offset)));
                 instr(&mut out, "call putc");
             }
 

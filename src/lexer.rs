@@ -6,7 +6,20 @@ pub enum TokenKind {
     Add(u8),
     /// Move the pointer by this many cells (negative is left).
     Move(isize),
-    Output,
+    /// Add to the cell at this offset from the pointer, without moving it (only made by -O2).
+    AddAt(isize, u8),
+    /// Set the cell at this offset to this value (only made by -O2). `[-]` is `Set(0, 0)`.
+    Set(isize, u8),
+    /// Add the current cell times this factor to the cell at this offset (only made by -O2).
+    ///
+    /// Multiply loops like `[->++<]` become a `MulAt` per target, then `Set(0, 0)`.
+    MulAt(isize, u8),
+    /// Move the pointer by this step until it lands on a zero cell (only made by -O2).
+    ///
+    /// `[>]` is `Scan(1)`, `[<<]` is `Scan(-2)`.
+    Scan(isize),
+    /// Print the cell at this offset (`.` is `Output(0)`).
+    Output(isize),
     Input,
     JmpZ(usize),
     JmpNZ(usize),
@@ -19,7 +32,7 @@ pub struct Token {
 }
 
 impl Token {
-    fn new(kind: TokenKind, span: Span) -> Self {
+    pub fn new(kind: TokenKind, span: Span) -> Self {
         Self { kind, span }
     }
 
@@ -43,7 +56,7 @@ impl TokenKind {
             '-' => Some(Self::Add(u8::MAX)),
             '>' => Some(Self::Move(1)),
             '<' => Some(Self::Move(-1)),
-            '.' => Some(Self::Output),
+            '.' => Some(Self::Output(0)),
             ',' => Some(Self::Input),
             '[' => Some(Self::JmpZ(0)),
             ']' => Some(Self::JmpNZ(0)),
