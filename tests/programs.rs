@@ -89,6 +89,14 @@ fn clear_loop() {
 }
 
 #[test]
+fn multiply_loop_that_does_not_run_touches_nothing() {
+    // The loop's target is 5000 cells left of the tape, but the counter is 0 (EOF),
+    // so the loop never runs. -O2 must not touch the target anyway.
+    let src = format!(",[{}+{}-]+.", "<".repeat(5000), ">".repeat(5000));
+    assert_output(&src, b"", b"\x01");
+}
+
+#[test]
 fn deeply_nested_loops() {
     let src = format!("+{}-{}+.", "[".repeat(500), "]".repeat(500));
     assert_output(&src, b"", b"\x01");
@@ -204,10 +212,38 @@ fn output_is_flushed_before_reading() {
 /// Random program; loops mostly decrement a counter with balanced moves so they tend to terminate.
 fn gen_program(rng: &mut Rng, depth: u32, budget: usize) -> String {
     const OPS: &[u8] = b"+++---><>><<..,";
+    // Shapes the -O2 passes look for: clears, scans, multiply loops, offset ops,
+    // and loops that are dead when the cell is known to be 0.
+    const FRAGMENTS: &[&str] = &[
+        "[-]",
+        "[+]",
+        "[---]",
+        "[[-]]",
+        ">[-]<",
+        "<[-]+>",
+        "[>]",
+        "[<]",
+        "[>>]",
+        "[<<<]",
+        "[->+<]",
+        "[>+<-]",
+        "[->>+++<<]",
+        "[-<+>>--<]",
+        "[+>-<]",
+        "[--->+<]",
+        "[-->+<]",
+        ">.<",
+        "<.>",
+        ">>.<<",
+        "[.]",
+        "[,.]",
+    ];
 
     let mut out = String::new();
     for _ in 0..budget {
-        if depth < 5 && rng.chance(0.1) {
+        if rng.chance(0.08) {
+            out += FRAGMENTS[rng.range(0, FRAGMENTS.len() - 1)];
+        } else if depth < 5 && rng.chance(0.1) {
             let inner_budget = rng.range(1, 12);
             let inner: String = gen_program(rng, depth + 1, inner_budget)
                 .chars()
