@@ -1,11 +1,11 @@
 use crate::errors::Span;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
-    Add,
-    Sub,
-    RMove,
-    LMove,
+    /// Add to the current cell, wrapping (`-` is `Add(255)`).
+    Add(u8),
+    /// Move the pointer by this many cells (negative is left).
+    Move(isize),
     Output,
     Input,
     JmpZ(usize),
@@ -39,10 +39,10 @@ impl Token {
 impl TokenKind {
     fn from_char(c: char) -> Option<Self> {
         match c {
-            '+' => Some(Self::Add),
-            '-' => Some(Self::Sub),
-            '>' => Some(Self::RMove),
-            '<' => Some(Self::LMove),
+            '+' => Some(Self::Add(1)),
+            '-' => Some(Self::Add(u8::MAX)),
+            '>' => Some(Self::Move(1)),
+            '<' => Some(Self::Move(-1)),
             '.' => Some(Self::Output),
             ',' => Some(Self::Input),
             '[' => Some(Self::JmpZ(0)),

@@ -55,10 +55,14 @@ pub fn generate(tokens: &[Token]) -> String {
 
     for token in tokens {
         match token.kind() {
-            TokenKind::Add => instr(&mut out, "inc byte [rbx]"),
-            TokenKind::Sub => instr(&mut out, "dec byte [rbx]"),
-            TokenKind::RMove => instr(&mut out, "inc rbx"),
-            TokenKind::LMove => instr(&mut out, "dec rbx"),
+            TokenKind::Add(1) => instr(&mut out, "inc byte [rbx]"),
+            TokenKind::Add(u8::MAX) => instr(&mut out, "dec byte [rbx]"),
+            TokenKind::Add(n) => instr(&mut out, &format!("add byte [rbx], {n}")),
+
+            TokenKind::Move(1) => instr(&mut out, "inc rbx"),
+            TokenKind::Move(-1) => instr(&mut out, "dec rbx"),
+            TokenKind::Move(n) if *n > 0 => instr(&mut out, &format!("add rbx, {n}")),
+            TokenKind::Move(n) => instr(&mut out, &format!("sub rbx, {}", n.unsigned_abs())),
 
             TokenKind::JmpZ(n) => {
                 label(&mut out, &format!(".loop_{}", n));
