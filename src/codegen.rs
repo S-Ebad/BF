@@ -49,6 +49,13 @@ fn move_ptr(out: &mut String, n: isize) {
     }
 }
 
+/// Sets the flags from the current cell, unless the last instruction already did.
+fn test_cell(out: &mut String, flags_from_cell: bool) {
+    if !flags_from_cell {
+        instr(out, "cmp byte [rbx], 0");
+    }
+}
+
 /// `putc` appends `cl` to the output buffer, flushing it when full.
 fn create_putc(out: &mut String) {
     label(out, "putc");
@@ -80,10 +87,21 @@ pub fn generate(tokens: &[Token]) -> String {
     instr(&mut out, "lea rbx, [rel tape]");
     instr(&mut out, "xor r12d, r12d");
 
+    // Whether the zero flag currently says if the current cell is 0, so the next
+    // loop check can skip its `cmp`. Arithmetic on the cell sets it, and so does a
+    // loop or scan check: every jump into the code after one agrees on the cell.
+    let mut flags_from_cell = false;
     let mut scans = 0;
+    let mut prev = None;
 
     for token in tokens {
-        match *token.kind() {
+        let kind = *token.kind();
+        // A `]` right after the cell was cleared never jumps back (multiply loops
+        // end like this), so it needs no check.
+        let loop_ends_cleared =
+            matches!(kind, TokenKind::JmpNZ(_)) && prev == Some(TokenKind::Set(0, 0));
+
+        match kind {
             TokenKind::Add(n) => add_cell(&mut out, 0, n),
             TokenKind::AddAt(offset, n) => add_cell(&mut out, offset, n),
             TokenKind::Move(n) => move_ptr(&mut out, n),
@@ -103,7 +121,7 @@ pub fn generate(tokens: &[Token]) -> String {
 
             // Laid out like a loop: check once on entry, then step and check at the bottom.
             TokenKind::Scan(step) => {
-                instr(&mut out, "cmp byte [rbx], 0");
+                test_cell(&mut out, flags_from_cell);
                 instr(&mut out, &format!("je .scan_end_{scans}"));
                 label(&mut out, &format!(".scan_{scans}"));
                 move_ptr(&mut out, step);
@@ -113,14 +131,18 @@ pub fn generate(tokens: &[Token]) -> String {
                 scans += 1;
             }
 
+            // `[` checks on entry and `]` jumps back to the start of the body, so each
+            // iteration runs a single check.
             TokenKind::JmpZ(n) => {
-                label(&mut out, &format!(".loop_{n}"));
-                instr(&mut out, "cmp byte [rbx], 0");
+                test_cell(&mut out, flags_from_cell);
                 instr(&mut out, &format!("je .end_{n}"));
+                label(&mut out, &format!(".loop_{n}"));
             }
             TokenKind::JmpNZ(n) => {
-                instr(&mut out, "cmp byte [rbx], 0");
-                instr(&mut out, &format!("jne .loop_{n}"));
+                if !loop_ends_cleared {
+                    test_cell(&mut out, flags_from_cell);
+                    instr(&mut out, &format!("jne .loop_{n}"));
+                }
                 label(&mut out, &format!(".end_{n}"));
             }
 
@@ -141,6 +163,14 @@ pub fn generate(tokens: &[Token]) -> String {
                 instr(&mut out, "syscall");
             }
         }
+
+        // Without its check, the code after a `]` is reached with the flags of
+        // whatever the body did last.
+        flags_from_cell = matches!(
+            kind,
+            TokenKind::Add(_) | TokenKind::Scan(_) | TokenKind::JmpZ(_) | TokenKind::JmpNZ(_)
+        ) && !loop_ends_cleared;
+        prev = Some(kind);
     }
 
     instr(&mut out, "call flush");
