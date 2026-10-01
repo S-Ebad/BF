@@ -43,7 +43,8 @@ pub fn write_output(asm: &str, config: &cli::Config) -> anyhow::Result<()> {
             run(Command::new("nasm")
                 .args(["-f", "elf64", "-o"])
                 .arg(&obj_path)
-                .arg(&asm_path))?;
+                .arg(&asm_path)
+                .arg("-O1"))?;
 
             if let cli::Emit::Exe = config.emit {
                 run(Command::new("ld").arg("-o").arg(&output).arg(&obj_path))?;
