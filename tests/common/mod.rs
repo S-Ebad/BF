@@ -11,7 +11,7 @@ pub const TAPE_LEN: usize = 30000;
 /// Every optimization level; program tests run against all of them.
 pub const OPT_LEVELS: [u8; 3] = [0, 1, 2];
 
-/// Reference interpreter: 8-bit wrapping cells, 30000-cell tape, EOF leaves the cell unchanged.
+/// Reference interpreter: 8-bit wrapping cells, 30000-cell tape, EOF sets the cell to 0.
 ///
 /// Returns `None` if the program leaves the tape (UB) or runs longer than `step_limit`.
 pub fn interpret(src: &str, input: &[u8], step_limit: u64) -> Option<Vec<u8>> {
@@ -55,9 +55,7 @@ pub fn interpret(src: &str, input: &[u8], step_limit: u64) -> Option<Vec<u8>> {
             b'<' => ptr = ptr.checked_sub(1)?,
             b'.' => out.push(tape[ptr]),
             b',' => {
-                if let Some(&b) = input.next() {
-                    tape[ptr] = b;
-                }
+                tape[ptr] = input.next().copied().unwrap_or(0);
             }
             b'[' if tape[ptr] == 0 => ip = jump[ip],
             b']' if tape[ptr] != 0 => ip = jump[ip],

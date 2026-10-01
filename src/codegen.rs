@@ -76,6 +76,8 @@ pub fn generate(tokens: &[Token]) -> String {
             TokenKind::Input => {
                 instr(&mut out, "call flush");
 
+                // EOF (or a failed read) leaves the cell at 0.
+                instr(&mut out, "mov byte [rbx], 0");
                 instr(&mut out, "mov rax, 0");
                 instr(&mut out, "mov rdi, 0");
                 instr(&mut out, "mov rsi, rbx");

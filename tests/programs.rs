@@ -149,9 +149,10 @@ fn reverse() {
 }
 
 #[test]
-fn eof_leaves_cell_unchanged() {
-    assert_output("+++++,.", b"", b"\x05");
-    assert_output(",.,.", b"A", b"AA");
+fn eof_sets_cell_to_zero() {
+    assert_output("+++++,.", b"", b"\x00");
+    assert_output(",.,.", b"A", b"A\x00");
+    assert_output(",>,.<.", b"A", b"\x00A");
 }
 
 #[test]
