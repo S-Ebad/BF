@@ -302,3 +302,8 @@ fn fuzz_o1() {
 fn fuzz_o2() {
     fuzz(2);
 }
+
+#[test]
+fn fuzz_o3() {
+    fuzz(3);
+}

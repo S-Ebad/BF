@@ -9,7 +9,7 @@ use tempfile::TempDir;
 pub const TAPE_LEN: usize = 30000;
 
 /// Every optimization level; program tests run against all of them.
-pub const OPT_LEVELS: [u8; 3] = [0, 1, 2];
+pub const OPT_LEVELS: [u8; 4] = [0, 1, 2, 3];
 
 /// Reference interpreter: 8-bit wrapping cells, 30000-cell tape, EOF sets the cell to 0.
 ///

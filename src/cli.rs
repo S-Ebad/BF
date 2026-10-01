@@ -16,8 +16,9 @@ pub struct Config {
     #[arg(long, value_enum, default_value_t = Emit::Exe)]
     pub emit: Emit,
 
-    /// Optimization level: 0 = none, 1 = collapse runs, 2 = pattern opcodes
-    #[arg(short = 'O', default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=2))]
+    /// Optimization level: 0 = none, 1 = collapse runs, 2 = pattern opcodes,
+    /// 3 = also run the program at compile time
+    #[arg(short = 'O', default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=3))]
     pub opt: u8,
 }
 

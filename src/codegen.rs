@@ -1,15 +1,11 @@
-use crate::lexer::{Token, TokenKind};
+use crate::{
+    evaluator::Evaluation,
+    lexer::{Token, TokenKind},
+};
 use std::fmt::Write;
 
-// initial code
-const INITIAL: &str = r#"section .bss
-tape: resb 30000 ; create tape
-outbuf: resb 4096
-
-section .text
-global _start
-
-"#;
+/// Number of cells on the tape.
+pub const TAPE_LEN: usize = 30000;
 
 // helpers to format instructions
 fn instr(out: &mut String, code: &str) {
@@ -56,6 +52,53 @@ fn test_cell(out: &mut String, flags_from_cell: bool) {
     }
 }
 
+/// Writes the `len` bytes at `name` to stdout.
+fn write_stdout(out: &mut String, name: &str, len: usize) {
+    instr(out, "mov eax, 1");
+    instr(out, "mov edi, 1");
+    instr(out, &format!("lea rsi, [rel {name}]"));
+    instr(out, &format!("mov edx, {len}"));
+    instr(out, "syscall");
+}
+
+fn exit(out: &mut String) {
+    instr(out, "mov eax, 60");
+    instr(out, "xor edi, edi");
+    instr(out, "syscall");
+}
+
+/// Defines `name` as these bytes.
+///
+/// They go after the final `exit` in `.text` rather than in `.rodata`: they're only
+/// ever read, and a separate section adds a page-aligned segment that doubles the
+/// size of a small executable.
+fn data(out: &mut String, name: &str, bytes: &[u8]) {
+    label(out, name);
+    for chunk in bytes.chunks(32) {
+        let bytes: Vec<String> = chunk.iter().map(u8::to_string).collect();
+        instr(out, &format!("db {}", bytes.join(", ")));
+    }
+}
+
+/// Index of the outermost loop's `[` that is still open at `index`, or `index` itself.
+///
+/// Code before it can never run once the program is at `index`.
+fn first_reachable(tokens: &[Token], index: usize) -> usize {
+    let mut open = Vec::new();
+
+    for (i, token) in tokens[..index].iter().enumerate() {
+        match token.kind() {
+            TokenKind::JmpZ(_) => open.push(i),
+            TokenKind::JmpNZ(_) => {
+                open.pop();
+            }
+            _ => (),
+        }
+    }
+
+    open.first().copied().unwrap_or(index)
+}
+
 /// `putc` appends `cl` to the output buffer, flushing it when full.
 fn create_putc(out: &mut String) {
     label(out, "putc");
@@ -79,13 +122,65 @@ fn create_putc(out: &mut String) {
     instr(out, "ret");
 }
 
-pub fn generate(tokens: &[Token]) -> String {
-    let mut out = String::from(INITIAL);
+/// Generates the program, starting from `start`: the state the program is in
+/// after running part of it at compile time (-O3), or the initial state.
+pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
+    let mut out = String::new();
+    let output = &start.output;
+
+    let Some(resume) = &start.resume else {
+        // The whole program ran at compile time: all that's left is its output.
+        out.push_str("section .text\nglobal _start\n\n");
+        label(&mut out, "_start");
+        if !output.is_empty() {
+            write_stdout(&mut out, "output", output.len());
+        }
+        exit(&mut out);
+
+        if !output.is_empty() {
+            data(&mut out, "output", output);
+        }
+        return out;
+    };
+
+    writeln!(
+        out,
+        "section .bss\ntape: resb {TAPE_LEN}\noutbuf: resb 4096\n\nsection .text\nglobal _start\n"
+    )
+    .unwrap();
     create_putc(&mut out);
 
     label(&mut out, "_start");
+
+    // Restore what ran at compile time: print its output, then copy in the tape.
+    if !output.is_empty() {
+        write_stdout(&mut out, "output", output.len());
+    }
+
+    let used = resume.tape.iter().position(|&c| c != 0).map(|lo| {
+        let hi = resume.tape.iter().rposition(|&c| c != 0).unwrap();
+        (lo, &resume.tape[lo..=hi])
+    });
+    if let Some((lo, cells)) = used {
+        instr(&mut out, "lea rsi, [rel tape_init]");
+        instr(&mut out, &format!("lea rdi, [rel tape + {lo}]"));
+        instr(&mut out, &format!("mov ecx, {}", cells.len()));
+        instr(&mut out, "rep movsb");
+    }
+
     instr(&mut out, "lea rbx, [rel tape]");
+    if resume.pointer != 0 {
+        move_ptr(&mut out, resume.pointer);
+    }
     instr(&mut out, "xor r12d, r12d");
+
+    // Carry on where compile time stopped. That can be inside a loop, whose `]`
+    // jumps back to code before that point, so code is emitted from the
+    // outermost open loop on.
+    let first = first_reachable(tokens, resume.index);
+    if first < resume.index {
+        instr(&mut out, "jmp .resume");
+    }
 
     // Whether the zero flag currently says if the current cell is 0, so the next
     // loop check can skip its `cmp`. Arithmetic on the cell sets it, and so does a
@@ -94,7 +189,13 @@ pub fn generate(tokens: &[Token]) -> String {
     let mut scans = 0;
     let mut prev = None;
 
-    for token in tokens {
+    for (i, token) in tokens.iter().enumerate().skip(first) {
+        if i == resume.index && first < resume.index {
+            label(&mut out, ".resume");
+            // Reached by the jump too, so the flags say nothing about the cell.
+            flags_from_cell = false;
+        }
+
         let kind = *token.kind();
         // A `]` right after the cell was cleared never jumps back (multiply loops
         // end like this), so it needs no check.
@@ -174,11 +275,14 @@ pub fn generate(tokens: &[Token]) -> String {
     }
 
     instr(&mut out, "call flush");
+    exit(&mut out);
 
-    // exit instruction
-    instr(&mut out, "mov eax, 60");
-    instr(&mut out, "xor edi, edi");
-    instr(&mut out, "syscall");
+    if !output.is_empty() {
+        data(&mut out, "output", output);
+    }
+    if let Some((_, cells)) = used {
+        data(&mut out, "tape_init", cells);
+    }
 
     out
 }

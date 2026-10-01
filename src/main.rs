@@ -1,10 +1,17 @@
-use crate::{codegen::generate, lexer::tokenize, optimizer::optimize, resolver::resolve_jumps};
+use crate::{
+    codegen::generate,
+    evaluator::{Evaluation, STEP_LIMIT, evaluate},
+    lexer::tokenize,
+    optimizer::optimize,
+    resolver::resolve_jumps,
+};
 use clap::Parser;
 
 mod cli;
 mod codegen;
 mod emit;
 mod errors;
+mod evaluator;
 mod lexer;
 mod optimizer;
 mod resolver;
@@ -21,7 +28,14 @@ fn compile(src: &str, opt: u8) -> Result<String, Vec<errors::BFError>> {
 
     let tokens = optimize(tokens, opt);
 
-    let asm = generate(&tokens);
+    // -O3 runs as much of the program as it can at compile time.
+    let start = if opt >= 3 {
+        evaluate(&tokens, STEP_LIMIT)
+    } else {
+        Evaluation::start()
+    };
+
+    let asm = generate(&tokens, &start);
 
     Ok(asm)
 }

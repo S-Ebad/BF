@@ -39,6 +39,23 @@ fn emit_obj() {
 }
 
 #[test]
+fn o3_compiles_finished_programs_to_their_output() {
+    let ws = Workspace::new();
+    ws.write("f.bf", PROGRAM);
+
+    assert!(
+        ws.brainfk(["f.bf", "-O3", "--emit", "asm"])
+            .status
+            .success()
+    );
+    let asm = std::fs::read_to_string(ws.path("a.asm")).unwrap();
+
+    // One write and one exit, and no tape.
+    assert_eq!(asm.matches("syscall").count(), 2, "{asm}");
+    assert!(!asm.contains("tape"), "{asm}");
+}
+
+#[test]
 fn output_flag() {
     let ws = Workspace::new();
     ws.write("f.bf", PROGRAM);
@@ -91,7 +108,7 @@ fn rejects_bad_arguments() {
     let ws = Workspace::new();
     ws.write("f.bf", PROGRAM);
 
-    for args in [&["f.bf", "-O3"][..], &["f.bf", "--emit", "wat"], &[]] {
+    for args in [&["f.bf", "-O4"][..], &["f.bf", "--emit", "wat"], &[]] {
         let out = ws.brainfk(args);
         assert_eq!(out.status.code(), Some(2), "args: {args:?}");
     }
