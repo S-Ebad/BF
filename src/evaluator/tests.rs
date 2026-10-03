@@ -16,7 +16,11 @@ fn eval(src: &str, level: u8, step_limit: u64) -> Evaluation {
 #[test]
 fn finished_programs_leave_only_output() {
     for level in [0, 1, 2] {
-        let e = eval(include_str!("../../tests/bf/hello.bf"), level, STEP_LIMIT);
+        let e = eval(
+            include_str!("../../tests/bf/hello.bf"),
+            level,
+            DEFAULT_STEP_LIMIT,
+        );
         assert_eq!(e.output, b"Hello World!\n", "-O{level}");
         assert!(e.resume.is_none(), "-O{level}");
     }
@@ -24,7 +28,7 @@ fn finished_programs_leave_only_output() {
 
 #[test]
 fn empty_program_finishes() {
-    let e = eval("", 2, STEP_LIMIT);
+    let e = eval("", 2, DEFAULT_STEP_LIMIT);
     assert!(e.output.is_empty());
     assert!(e.resume.is_none());
 }
@@ -32,7 +36,7 @@ fn empty_program_finishes() {
 #[test]
 fn stops_at_input() {
     let src = "+++.>++,+.";
-    let e = eval(src, 0, STEP_LIMIT);
+    let e = eval(src, 0, DEFAULT_STEP_LIMIT);
     assert_eq!(e.output, [3]);
 
     let resume = e.resume.unwrap();
@@ -43,7 +47,7 @@ fn stops_at_input() {
 
 #[test]
 fn stops_at_step_limit() {
-    let e = eval("+.[]", 0, STEP_LIMIT);
+    let e = eval("+.[]", 0, 1000);
     assert_eq!(e.output, [1]);
     assert!(e.resume.is_some());
 }
@@ -68,14 +72,14 @@ fn can_stop_inside_a_loop() {
 #[test]
 fn stops_before_leaving_the_tape() {
     // `<+` touches the cell left of the tape: undefined, so left to the program.
-    let e = eval("+.<+", 0, STEP_LIMIT);
+    let e = eval("+.<+", 0, DEFAULT_STEP_LIMIT);
     assert_eq!(e.output, [1]);
     let resume = e.resume.unwrap();
     assert_eq!(resume.index, 3);
     assert_eq!(resume.pointer, -1);
 
     // Same with an offset op at -O2.
-    let resume = eval(",<+>", 2, STEP_LIMIT).resume.unwrap();
+    let resume = eval(",<+>", 2, DEFAULT_STEP_LIMIT).resume.unwrap();
     assert_eq!(resume.index, 0);
 }
 
@@ -83,7 +87,7 @@ fn stops_before_leaving_the_tape() {
 fn scans_stop_partway() {
     // Cells 1..=5 are set; the scan from cell 1 has 5 cells to cross.
     let src = ">+>+>+>+>+<<<<[>]";
-    let full = eval(src, 2, STEP_LIMIT);
+    let full = eval(src, 2, DEFAULT_STEP_LIMIT);
     assert!(full.resume.is_none());
 
     let tokens = tokens(src, 2);
@@ -97,8 +101,8 @@ fn scans_stop_partway() {
 fn optimized_ops_match_their_loops() {
     // Multiply, clear, scan and offset ops, checked against -O0 running the loops.
     let src = "+++++[->++>+++<<]>>[-<+>]<.>>+<<[>]<<.";
-    let plain = eval(src, 0, STEP_LIMIT);
-    let optimized = eval(src, 2, STEP_LIMIT);
+    let plain = eval(src, 0, DEFAULT_STEP_LIMIT);
+    let optimized = eval(src, 2, DEFAULT_STEP_LIMIT);
     assert_eq!(plain.output, optimized.output);
     assert!(optimized.resume.is_none());
 }

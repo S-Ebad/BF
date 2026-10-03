@@ -56,6 +56,29 @@ fn o3_compiles_finished_programs_to_their_output() {
 }
 
 #[test]
+fn step_limit_flag() {
+    let ws = Workspace::new();
+    // Prints `F`, then loops forever.
+    ws.write("f.bf", format!("{PROGRAM}+[]"));
+
+    // The limit decides how far -O3 gets: with 0 steps nothing runs at compile time,
+    // with 10000 the `F` is already part of the compiled program's startup.
+    for (limit, printed_at_compile_time) in [("0", false), ("10000", true)] {
+        let out = ws.brainfk(["f.bf", "-O3", "--emit", "asm", "-s", limit]);
+        assert!(out.status.success(), "-s {limit}");
+
+        let asm = std::fs::read_to_string(ws.path("a.asm")).unwrap();
+        assert_eq!(
+            asm.contains("output:"),
+            printed_at_compile_time,
+            "-s {limit}"
+        );
+    }
+
+    assert_eq!(ws.brainfk(["f.bf", "-s", "lots"]).status.code(), Some(2));
+}
+
+#[test]
 fn output_flag() {
     let ws = Workspace::new();
     ws.write("f.bf", PROGRAM);

@@ -1,6 +1,6 @@
 use crate::{
     codegen::generate,
-    evaluator::{Evaluation, STEP_LIMIT, evaluate},
+    evaluator::{Evaluation, evaluate},
     lexer::tokenize,
     optimizer::optimize,
     resolver::resolve_jumps,
@@ -16,7 +16,7 @@ mod lexer;
 mod optimizer;
 mod resolver;
 
-fn compile(src: &str, opt: u8) -> Result<String, Vec<errors::BFError>> {
+fn compile(src: &str, opt: u8, step_limit: u64) -> Result<String, Vec<errors::BFError>> {
     let mut tokens = tokenize(src);
 
     // Resolve before optimizing, so every bracket is checked against the source as written.
@@ -30,7 +30,7 @@ fn compile(src: &str, opt: u8) -> Result<String, Vec<errors::BFError>> {
 
     // -O3 runs as much of the program as it can at compile time.
     let start = if opt >= 3 {
-        evaluate(&tokens, STEP_LIMIT)
+        evaluate(&tokens, step_limit)
     } else {
         Evaluation::start()
     };
@@ -44,7 +44,7 @@ fn main() -> anyhow::Result<()> {
     let config = cli::Config::parse();
     let src = config.read_source()?;
 
-    let asm = compile(&src, config.opt).map_err(|errors| {
+    let asm = compile(&src, config.opt, config.step_limit).map_err(|errors| {
         let count = errors.len();
         errors::report(&src, errors);
 

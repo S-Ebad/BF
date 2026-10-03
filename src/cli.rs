@@ -1,3 +1,4 @@
+use crate::evaluator::DEFAULT_STEP_LIMIT;
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
@@ -20,6 +21,10 @@ pub struct Config {
     /// 3 = also run the program at compile time
     #[arg(short = 'O', default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=3))]
     pub opt: u8,
+
+    /// How many steps -O3 runs the program for at compile time before giving up
+    #[arg(short, long, default_value_t = DEFAULT_STEP_LIMIT)]
+    pub step_limit: u64,
 }
 
 impl Config {
