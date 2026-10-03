@@ -415,8 +415,10 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
     let mut out = String::new();
     let output = &start.output;
 
-    let Some(resume) = &start.resume else {
-        // The whole program ran at compile time: all that's left is its output.
+    // Nothing left to run: the whole program ran at compile time, or it had no
+    // commands to begin with (or only loops -O2 removed as dead). All that's left is
+    // its output.
+    let Some(resume) = start.resume.as_ref().filter(|_| !tokens.is_empty()) else {
         out.push_str("section .text\nglobal _start\n\n");
         label(&mut out, "_start");
         if !output.is_empty() {

@@ -56,6 +56,40 @@ fn o3_compiles_finished_programs_to_their_output() {
 }
 
 #[test]
+fn programs_without_commands_only_exit() {
+    let ws = Workspace::new();
+
+    // No commands at all, and -O2 removing everything as dead loops: a loop at the
+    // start, a comment loop, and a loop right after another loop.
+    for (src, opt) in [
+        ("", "0"),
+        ("just a comment", "2"),
+        ("[,>]", "2"),
+        ("[a comment, with. commands-]", "2"),
+        ("[,>][.+]", "2"),
+    ] {
+        ws.write("f.bf", src);
+        assert!(
+            ws.brainfk(["f.bf", "-O", opt, "--emit", "asm"])
+                .status
+                .success()
+        );
+        let asm = std::fs::read_to_string(ws.path("a.asm")).unwrap();
+
+        // Just the exit: no write, no tape, no output buffer.
+        assert_eq!(asm.matches("syscall").count(), 1, "{src:?}\n{asm}");
+        assert!(
+            !asm.contains("tape") && !asm.contains("outbuf"),
+            "{src:?}\n{asm}"
+        );
+
+        assert!(ws.brainfk(["f.bf", "-O", opt]).status.success());
+        let out = run(&ws.path("a.out"), b"input that is never read");
+        assert!(out.status.success() && out.stdout.is_empty(), "{src:?}");
+    }
+}
+
+#[test]
 fn step_limit_flag() {
     let ws = Workspace::new();
     // Prints `F`, then loops forever.
