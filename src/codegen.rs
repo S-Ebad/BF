@@ -52,6 +52,130 @@ fn test_cell(out: &mut String, flags_cell: Option<isize>, offset: isize) {
     }
 }
 
+/// What codegen knows about the registers at the current point.
+#[derive(Default, Clone, Copy)]
+struct State {
+    /// The offset of the cell the zero flag reflects (it's set when that cell is 0),
+    /// so the next check of that cell can skip its `cmp`. Arithmetic on a cell sets
+    /// it, and so does a loop or scan check: every jump into the code after one agrees.
+    flags_cell: Option<isize>,
+    /// The cell whose value is in `eax`, so a group of multiplies loads it once.
+    loaded: Option<isize>,
+}
+
+impl State {
+    /// The same knowledge after the pointer moves by `n` cells without touching
+    /// the flags or `eax` (a `lea`).
+    fn moved(self, n: isize) -> Self {
+        Self {
+            flags_cell: self.flags_cell.map(|offset| offset - n),
+            loaded: self.loaded.map(|offset| offset - n),
+        }
+    }
+}
+
+/// Emits an op that works on cells, with every offset `shift` cells further on.
+///
+/// Returns false for ops that aren't straight-line cell ops.
+fn cell_op(out: &mut String, state: &mut State, kind: TokenKind, shift: isize) -> bool {
+    match kind {
+        TokenKind::Add(n) => {
+            add_cell(out, shift, n);
+            *state = State {
+                flags_cell: Some(shift),
+                loaded: None,
+            };
+        }
+        TokenKind::AddAt(offset, n) => {
+            add_cell(out, offset + shift, n);
+            *state = State {
+                flags_cell: Some(offset + shift),
+                loaded: None,
+            };
+        }
+        TokenKind::MulAt(from, to, factor) => {
+            let (from, to) = (from + shift, to + shift);
+            if state.loaded != Some(from) {
+                instr(out, &format!("movzx eax, {}", cell(from)));
+            }
+            match factor {
+                1 => instr(out, &format!("add {}, al", cell(to))),
+                u8::MAX => instr(out, &format!("sub {}, al", cell(to))),
+                _ => {
+                    instr(out, &format!("imul ecx, eax, {factor}"));
+                    instr(out, &format!("add {}, cl", cell(to)));
+                }
+            }
+            // The last instruction is the add or sub into the target.
+            *state = State {
+                flags_cell: Some(to),
+                loaded: Some(from),
+            };
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Emits a group of `Set`s, combining neighbouring cells into wider stores: setting
+/// 9 cells to 0 is a `qword` store and a `byte` store instead of 9 `byte` stores.
+///
+/// `sets` are in program order; a later set of the same cell wins.
+fn set_cells(out: &mut String, state: &mut State, sets: &[(isize, u8)], shift: isize) {
+    let mut cells: Vec<(isize, u8)> = Vec::with_capacity(sets.len());
+    for &(offset, n) in sets {
+        let offset = offset + shift;
+        match cells.iter_mut().find(|(o, _)| *o == offset) {
+            Some(cell) => cell.1 = n,
+            None => cells.push((offset, n)),
+        }
+    }
+    cells.sort_by_key(|&(offset, _)| offset);
+
+    for run in cells.chunk_by(|a, b| a.0 + 1 == b.0) {
+        let mut rest = run;
+        while let Some(&(offset, _)) = rest.first() {
+            let size = [8, 4, 2, 1]
+                .into_iter()
+                .find(|&size| size <= rest.len() && fits_store(&rest[..size]))
+                .unwrap();
+            let value = rest[..size]
+                .iter()
+                .rev()
+                .fold(0u64, |acc, &(_, n)| (acc << 8) | u64::from(n));
+            let width = match size {
+                8 => "qword",
+                4 => "dword",
+                2 => "word",
+                _ => "byte",
+            };
+            instr(out, &format!("mov {width} [rbx{offset:+}], {value}"));
+            rest = &rest[size..];
+        }
+    }
+
+    // `mov` leaves the flags alone, so they still hold unless that cell was set.
+    if let Some(flagged) = state.flags_cell
+        && cells.iter().any(|&(offset, _)| offset == flagged)
+    {
+        state.flags_cell = None;
+    }
+    state.loaded = None;
+}
+
+/// Whether these cells can be set with one `mov` of an immediate. A `qword` store
+/// only takes a sign-extended 32-bit immediate.
+fn fits_store(cells: &[(isize, u8)]) -> bool {
+    if cells.len() < 8 {
+        return true;
+    }
+    let value = cells
+        .iter()
+        .rev()
+        .fold(0u64, |acc, &(_, n)| (acc << 8) | u64::from(n));
+    i32::try_from(value as i64).is_ok()
+}
+
 /// How many cells a `Scan` checks per iteration.
 const SCAN_UNROLL: isize = 4;
 
@@ -100,12 +224,32 @@ fn exit(out: &mut String) {
 /// They go after the final `exit` in `.text` rather than in `.rodata`: they're only
 /// ever read, and a separate section adds a page-aligned segment that doubles the
 /// size of a small executable.
+///
+/// Runs of the same byte are written with `times`, so a tape full of 1s is one line.
 fn data(out: &mut String, name: &str, bytes: &[u8]) {
+    /// Runs at least this long get a `times` line of their own.
+    const MIN_RUN: usize = 16;
+
     label(out, name);
-    for chunk in bytes.chunks(32) {
-        let bytes: Vec<String> = chunk.iter().map(u8::to_string).collect();
-        instr(out, &format!("db {}", bytes.join(", ")));
+
+    let mut pending: Vec<u8> = Vec::new();
+    let flush = |out: &mut String, pending: &mut Vec<u8>| {
+        for chunk in pending.chunks(32) {
+            let bytes: Vec<String> = chunk.iter().map(u8::to_string).collect();
+            instr(out, &format!("db {}", bytes.join(", ")));
+        }
+        pending.clear();
+    };
+
+    for run in bytes.chunk_by(|a, b| a == b) {
+        if run.len() >= MIN_RUN {
+            flush(out, &mut pending);
+            instr(out, &format!("times {} db {}", run.len(), run[0]));
+        } else {
+            pending.extend_from_slice(run);
+        }
     }
+    flush(out, &mut pending);
 }
 
 /// Index of the outermost loop's `[` that is still open at `index`, or `index` itself.
@@ -125,6 +269,121 @@ fn first_reachable(tokens: &[Token], index: usize) -> usize {
     }
 
     open.first().copied().unwrap_or(index)
+}
+
+/// For each bracket, the index of its partner. Other tokens map to 0.
+fn match_loops(tokens: &[Token]) -> Vec<usize> {
+    let mut partner = vec![0; tokens.len()];
+    let mut open = Vec::new();
+
+    for (i, token) in tokens.iter().enumerate() {
+        match token.kind() {
+            TokenKind::JmpZ(..) => open.push(i),
+            TokenKind::JmpNZ(..) => {
+                let j = open.pop().expect("jumps are resolved");
+                partner[i] = j;
+                partner[j] = i;
+            }
+            _ => (),
+        }
+    }
+
+    partner
+}
+
+/// If a loop checking the cell at `offset` can be unrolled, how far its body moves
+/// the pointer.
+///
+/// That's a body of only cell ops and `Set`s, with at most one `Move`, at the end
+/// (which is where -O2 leaves it). A body that sets the loop's own cell runs at
+/// most once, so there's nothing to gain.
+fn unrollable(body: &[Token], offset: isize) -> Option<isize> {
+    let (ops, step) = match body.split_last().map(|(last, rest)| (*last.kind(), rest)) {
+        Some((TokenKind::Move(step), rest)) => (rest, step),
+        _ => (body, 0),
+    };
+
+    let straight = ops.iter().all(|t| match *t.kind() {
+        TokenKind::Add(_) | TokenKind::AddAt(..) | TokenKind::MulAt(..) => true,
+        TokenKind::Set(cell, _) => cell != offset,
+        _ => false,
+    });
+
+    (straight && !ops.is_empty()).then_some(step)
+}
+
+/// Emits a loop with its body twice per iteration: the second copy is shifted by
+/// `step`, the distance one pass moves, so the pointer only moves once per two
+/// passes and there's one jump back instead of two.
+fn unrolled_loop(
+    out: &mut String,
+    state: &mut State,
+    body: &[Token],
+    n: usize,
+    offset: isize,
+    step: isize,
+) {
+    let ops = match body.last().map(|t| *t.kind()) {
+        Some(TokenKind::Move(_)) => &body[..body.len() - 1],
+        _ => body,
+    };
+    // After one pass, the exit lands one step on.
+    let half_exit = if step == 0 {
+        format!(".end_{n}")
+    } else {
+        format!(".half_{n}")
+    };
+
+    test_cell(out, state.flags_cell, offset);
+    instr(out, &format!("je .end_{n}"));
+    label(out, &format!(".loop_{n}"));
+    *state = State {
+        flags_cell: Some(offset),
+        loaded: None,
+    };
+
+    for shift in [0, step] {
+        let mut sets = Vec::new();
+        for token in ops {
+            match *token.kind() {
+                TokenKind::Set(cell, value) => sets.push((cell, value)),
+                kind => {
+                    if !sets.is_empty() {
+                        set_cells(out, state, &std::mem::take(&mut sets), shift);
+                    }
+                    cell_op(out, state, kind, shift);
+                }
+            }
+        }
+        if !sets.is_empty() {
+            set_cells(out, state, &sets, shift);
+        }
+
+        if shift == 0 {
+            test_cell(out, state.flags_cell, offset + step);
+            instr(out, &format!("je {half_exit}"));
+        }
+    }
+
+    if step != 0 {
+        instr(out, &format!("lea rbx, [rbx{:+}]", 2 * step));
+        *state = state.moved(2 * step);
+    }
+    test_cell(out, state.flags_cell, offset);
+    instr(out, &format!("jne .loop_{n}"));
+
+    if step != 0 {
+        // Both ways out arrive with the zero flag set by the loop's cell; `lea`
+        // moves the pointer onto it without touching the flags.
+        instr(out, &format!("jmp .end_{n}"));
+        label(out, &half_exit);
+        instr(out, &format!("lea rbx, [rbx{step:+}]"));
+    }
+    label(out, &format!(".end_{n}"));
+    *state = State {
+        flags_cell: Some(offset),
+        loaded: None,
+    };
 }
 
 /// `putc` appends `cl` to the output buffer, flushing it when full.
@@ -211,48 +470,54 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
         instr(&mut out, "jmp .resume");
     }
 
-    // The offset of the cell the zero flag currently reflects (0 means it's set), so
-    // the next check of that cell can skip its `cmp`. Arithmetic on a cell sets it,
-    // and so does a loop or scan check: every jump into the code after one agrees.
-    let mut flags_cell: Option<isize> = None;
-    // The cell whose value is in `eax`, so a group of multiplies loads it once.
-    let mut loaded: Option<isize> = None;
+    let partner = match_loops(tokens);
+    // Whether there's a `.resume` label to put before `tokens[resume.index]`.
+    let resume_label = first < resume.index;
+    let mut state = State::default();
     let mut scans = 0;
-    let mut prev = None;
+    // Cells the `Set`s just before the current token set to 0.
+    let mut cleared: Vec<isize> = Vec::new();
+    let mut i = first;
 
-    for (i, token) in tokens.iter().enumerate().skip(first) {
-        if i == resume.index && first < resume.index {
+    while i < tokens.len() {
+        if i == resume.index && resume_label {
             label(&mut out, ".resume");
             // Reached by the jump too, so nothing is known about the flags or `eax`.
-            flags_cell = None;
-            loaded = None;
+            state = State::default();
         }
 
-        let kind = *token.kind();
-        // A `]` right after its cell was cleared never jumps back, so it needs no check.
-        let loop_ends_cleared = match kind {
-            TokenKind::JmpNZ(_, offset) => prev == Some(TokenKind::Set(offset, 0)),
-            _ => false,
-        };
+        let kind = *tokens[i].kind();
+        let just_cleared = std::mem::take(&mut cleared);
+
+        if cell_op(&mut out, &mut state, kind, 0) {
+            i += 1;
+            continue;
+        }
 
         match kind {
-            TokenKind::Add(n) => add_cell(&mut out, 0, n),
-            TokenKind::AddAt(offset, n) => add_cell(&mut out, offset, n),
-            TokenKind::Move(n) => move_ptr(&mut out, n),
-            TokenKind::Set(offset, n) => instr(&mut out, &format!("mov {}, {n}", cell(offset))),
+            TokenKind::Set(..) => {
+                // All the Sets in a row, but not past the `.resume` label.
+                let mut sets = Vec::new();
+                while let Some(TokenKind::Set(offset, n)) = tokens.get(i).map(|t| *t.kind())
+                    && (sets.is_empty() || !(i == resume.index && resume_label))
+                {
+                    sets.push((offset, n));
+                    i += 1;
+                }
+                set_cells(&mut out, &mut state, &sets, 0);
+                cleared = sets
+                    .iter()
+                    .filter(|&&(offset, _)| {
+                        sets.iter().rev().find(|(o, _)| *o == offset).unwrap().1 == 0
+                    })
+                    .map(|&(offset, _)| offset)
+                    .collect();
+                continue;
+            }
 
-            TokenKind::MulAt(from, to, factor) => {
-                if loaded != Some(from) {
-                    instr(&mut out, &format!("movzx eax, {}", cell(from)));
-                }
-                match factor {
-                    1 => instr(&mut out, &format!("add {}, al", cell(to))),
-                    u8::MAX => instr(&mut out, &format!("sub {}, al", cell(to))),
-                    _ => {
-                        instr(&mut out, &format!("imul ecx, eax, {factor}"));
-                        instr(&mut out, &format!("add {}, cl", cell(to)));
-                    }
-                }
+            TokenKind::Move(n) => {
+                move_ptr(&mut out, n);
+                state = State::default();
             }
 
             // Laid out like a loop, checking SCAN_UNROLL cells per iteration. The
@@ -262,7 +527,7 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
                 let k = scans;
                 scans += 1;
 
-                test_cell(&mut out, flags_cell, 0);
+                test_cell(&mut out, state.flags_cell, 0);
                 instr(&mut out, &format!("je .scan_end_{k}"));
                 label(&mut out, &format!(".scan_{k}"));
                 for ahead in 1..SCAN_UNROLL {
@@ -279,19 +544,45 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
                     instr(&mut out, &format!("lea rbx, [rbx{step:+}]"));
                 }
                 label(&mut out, &format!(".scan_end_{k}"));
+                state = State {
+                    flags_cell: Some(0),
+                    loaded: None,
+                };
             }
 
-            // `[` checks on entry and `]` jumps back to the start of the body, so each
-            // iteration runs a single check.
             TokenKind::JmpZ(n, offset) => {
-                test_cell(&mut out, flags_cell, offset);
+                let end = partner[i];
+                let resume_inside = resume_label && (i + 1..=end).contains(&resume.index);
+
+                if !resume_inside && let Some(step) = unrollable(&tokens[i + 1..end], offset) {
+                    unrolled_loop(&mut out, &mut state, &tokens[i + 1..end], n, offset, step);
+                    i = end + 1;
+                    continue;
+                }
+
+                // `[` checks on entry and `]` jumps back to the start of the body, so
+                // each iteration runs a single check.
+                test_cell(&mut out, state.flags_cell, offset);
                 instr(&mut out, &format!("je .end_{n}"));
                 label(&mut out, &format!(".loop_{n}"));
+                state = State {
+                    flags_cell: Some(offset),
+                    loaded: None,
+                };
             }
             TokenKind::JmpNZ(n, offset) => {
-                if !loop_ends_cleared {
-                    test_cell(&mut out, flags_cell, offset);
+                // A `]` right after its cell was cleared never jumps back, so it needs
+                // no check. Then the code after it is reached with the flags of
+                // whatever the body did last.
+                if just_cleared.contains(&offset) {
+                    state = State::default();
+                } else {
+                    test_cell(&mut out, state.flags_cell, offset);
                     instr(&mut out, &format!("jne .loop_{n}"));
+                    state = State {
+                        flags_cell: Some(offset),
+                        loaded: None,
+                    };
                 }
                 label(&mut out, &format!(".end_{n}"));
             }
@@ -299,6 +590,7 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
             TokenKind::Output(offset) => {
                 instr(&mut out, &format!("mov cl, {}", cell(offset)));
                 instr(&mut out, "call putc");
+                state = State::default();
             }
 
             TokenKind::Input(offset) => {
@@ -311,26 +603,15 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
                 instr(&mut out, &format!("lea rsi, [rbx{offset:+}]"));
                 instr(&mut out, "mov rdx, 1");
                 instr(&mut out, "syscall");
+                state = State::default();
+            }
+
+            TokenKind::Add(_) | TokenKind::AddAt(..) | TokenKind::MulAt(..) => {
+                unreachable!("handled by cell_op")
             }
         }
 
-        flags_cell = match kind {
-            TokenKind::Add(_) | TokenKind::Scan(_) => Some(0),
-            TokenKind::AddAt(offset, _) | TokenKind::JmpZ(_, offset) => Some(offset),
-            // Without its check, the code after a `]` is reached with the flags of
-            // whatever the body did last.
-            TokenKind::JmpNZ(_, offset) if !loop_ends_cleared => Some(offset),
-            // The last instruction is the add or sub into the target.
-            TokenKind::MulAt(_, to, _) => Some(to),
-            // `mov` leaves the flags alone, so they still hold for any other cell.
-            TokenKind::Set(offset, _) if flags_cell != Some(offset) => flags_cell,
-            _ => None,
-        };
-        loaded = match kind {
-            TokenKind::MulAt(from, _, _) => Some(from),
-            _ => None,
-        };
-        prev = Some(kind);
+        i += 1;
     }
 
     instr(&mut out, "call flush");

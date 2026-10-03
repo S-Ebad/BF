@@ -106,6 +106,75 @@ fn loops_at_an_offset() {
 }
 
 #[test]
+fn unrolled_loops() {
+    // Loops whose body is only cell ops run two passes per iteration at -O2. These
+    // stop after an odd and an even number of passes, and after one.
+    for src in [
+        ">+>+>+>+[-<]>.>.>.>.",
+        ">+>+>+[-<]>.>.>.",
+        ">+[-<]>.",
+        // Walks right, adding to the cell 3 back: its last op lands on the loop's
+        // cell of the next pass but one.
+        ">>>+>+>+>+>+<<<<[-<<<+>>>>]<<<<<<<<.>.>.>.>.>.>.>.>.",
+        ">>>+>+>+>+<<<[-<<<+>>>>]<<<<<<<.>.>.>.>.>.>.>.",
+        // Doesn't move: a Set and an add per pass, at an offset.
+        "+++++[>[-]+>++<<-]>.>.",
+        "++++[>[-]+++>+<<-]>.>.",
+    ] {
+        assert_matches_interpreter(src, b"");
+    }
+
+    // Mandelbrot's hot loop: walking left 9 cells at a time, moving field 1 of each
+    // record one record to the right.
+    for records in [1, 2, 3, 6] {
+        let mut src = String::new();
+        for value in 1..=records {
+            src += &format!("{}+>{}<", ">".repeat(9), "+".repeat(value * 2));
+        }
+        src += "[>[->>>>>>>>>+<<<<<<<<<]<<<<<<<<<<]";
+        for _ in 0..=records {
+            src += ">.>>>>>>>>";
+        }
+        assert_matches_interpreter(&src, b"");
+    }
+}
+
+#[test]
+fn combined_stores() {
+    // Runs of Sets of different lengths and values become wider stores at -O2.
+    for len in [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17] {
+        let mut src = String::from(",");
+        for i in 0..len {
+            src += &format!(">[-]{}", "+".repeat(i % 3 * 100));
+        }
+        src += &"<".repeat(len);
+        src += &">.".repeat(len);
+        assert_matches_interpreter(&src, b"x");
+    }
+}
+
+#[test]
+fn infinite_loops_keep_running() {
+    // The body ends by setting the loop's cell to 1, so the loop never exits. A `]`
+    // right after a Set to 0 needs no check, but this one does.
+    for src in ["+[[-]+]", "+[>[-]<[-]+]"] {
+        for opt in OPT_LEVELS {
+            let ws = Workspace::new();
+            let mut child = std::process::Command::new(build(&ws, src, opt))
+                .spawn()
+                .unwrap();
+
+            std::thread::sleep(Duration::from_millis(200));
+            let status = child.try_wait().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+
+            assert!(status.is_none(), "-O{opt} {src:?}: exited with {status:?}");
+        }
+    }
+}
+
+#[test]
 fn check_after_set_reads_the_new_value() {
     // After the first loop the zero flag says the cell is 0. `[-]+++` becomes a
     // Set, which changes the cell without touching the flags, so the next loop
@@ -263,6 +332,13 @@ fn gen_program(rng: &mut Rng, depth: u32, budget: usize) -> String {
         "[>[-<+>]<-]",
         "[>>>>>>>>>]",
         "[<<<<<<<<<]",
+        // Loops of only cell ops, which are unrolled, and runs of Sets.
+        "[-<]",
+        "[->]",
+        "[+>>]",
+        "[>[-]+<-]",
+        "[->+>]",
+        ">[-]>[-]>[-]+>[-]<<<<",
     ];
 
     let mut out = String::new();
