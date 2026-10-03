@@ -97,6 +97,23 @@ fn multiply_loop_that_does_not_run_touches_nothing() {
 }
 
 #[test]
+fn loops_at_an_offset() {
+    // At -O2 the `[<.>-]` runs at offset 1 without moving the pointer, and the
+    // current cell is still 1 after it, so `[.-]` runs.
+    assert_output("+>+[<.>-]<[.-]", b"", b"\x01\x01");
+    // A copy loop one cell over, inside a loop that walks left along the tape.
+    assert_output(">+>+>+[>[-<+>]<<]>.>.>.", b"", b"\x03\x00\x00");
+}
+
+#[test]
+fn check_after_set_reads_the_new_value() {
+    // After the first loop the zero flag says the cell is 0. `[-]+++` becomes a
+    // Set, which changes the cell without touching the flags, so the next loop
+    // must check the cell again.
+    assert_output("+[.-][-]+++[.-]", b"", b"\x01\x03\x02\x01");
+}
+
+#[test]
 fn deeply_nested_loops() {
     let src = format!("+{}-{}+.", "[".repeat(500), "]".repeat(500));
     assert_output(&src, b"", b"\x01");
@@ -237,6 +254,15 @@ fn gen_program(rng: &mut Rng, depth: u32, budget: usize) -> String {
         ">>.<<",
         "[.]",
         "[,.]",
+        // Loops whose body doesn't move the pointer overall, which run at an offset.
+        ">[<+>-]<",
+        "<[>.<-]>",
+        ">>[<+<++>>-]<<",
+        ">[<[-]>-]<",
+        ">,[<.>-]<",
+        "[>[-<+>]<-]",
+        "[>>>>>>>>>]",
+        "[<<<<<<<<<]",
     ];
 
     let mut out = String::new();

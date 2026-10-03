@@ -81,11 +81,14 @@ pub fn evaluate(tokens: &[Token], step_limit: u64) -> Evaluation {
                 let Some(i) = at(pointer, offset) else { break };
                 tape[i] = n;
             }
-            MulAt(offset, factor) => {
-                let (Some(from), Some(to)) = (at(pointer, 0), at(pointer, offset)) else {
-                    break;
-                };
-                tape[to] = tape[to].wrapping_add(tape[from].wrapping_mul(factor));
+            MulAt(from, to, factor) => {
+                let Some(from) = at(pointer, from) else { break };
+                // With a 0 counter it adds nothing, wherever the target is. The loop
+                // it came from wouldn't have run, so the target can even be off the tape.
+                if tape[from] != 0 {
+                    let Some(to) = at(pointer, to) else { break };
+                    tape[to] = tape[to].wrapping_add(tape[from].wrapping_mul(factor));
+                }
             }
             // Stopping partway through a scan is fine: resuming it carries on from
             // wherever the pointer got to.
@@ -104,17 +107,17 @@ pub fn evaluate(tokens: &[Token], step_limit: u64) -> Evaluation {
                 let Some(i) = at(pointer, offset) else { break };
                 output.push(tape[i]);
             }
-            Input => break,
+            Input(_) => break,
             // Jumping to the partner and then stepping past it lands after `]` for
             // `[`, and at the start of the body for `]`.
-            JmpZ(_) => {
-                let Some(i) = at(pointer, 0) else { break };
+            JmpZ(_, offset) => {
+                let Some(i) = at(pointer, offset) else { break };
                 if tape[i] == 0 {
                     index = partner[index];
                 }
             }
-            JmpNZ(_) => {
-                let Some(i) = at(pointer, 0) else { break };
+            JmpNZ(_, offset) => {
+                let Some(i) = at(pointer, offset) else { break };
                 if tape[i] != 0 {
                     index = partner[index];
                 }
@@ -140,8 +143,8 @@ fn match_loops(tokens: &[Token]) -> Vec<usize> {
 
     for (i, token) in tokens.iter().enumerate() {
         match token.kind() {
-            TokenKind::JmpZ(_) => open.push(i),
-            TokenKind::JmpNZ(_) => {
+            TokenKind::JmpZ(..) => open.push(i),
+            TokenKind::JmpNZ(..) => {
                 let j = open.pop().expect("jumps are resolved");
                 partner[i] = j;
                 partner[j] = i;

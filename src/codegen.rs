@@ -45,11 +45,39 @@ fn move_ptr(out: &mut String, n: isize) {
     }
 }
 
-/// Sets the flags from the current cell, unless the last instruction already did.
-fn test_cell(out: &mut String, flags_from_cell: bool) {
-    if !flags_from_cell {
-        instr(out, "cmp byte [rbx], 0");
+/// Sets the zero flag from the cell at `offset`, unless it already reflects that cell.
+fn test_cell(out: &mut String, flags_cell: Option<isize>, offset: isize) {
+    if flags_cell != Some(offset) {
+        instr(out, &format!("cmp {}, 0", cell(offset)));
     }
+}
+
+/// How many cells a `Scan` checks per iteration.
+const SCAN_UNROLL: isize = 4;
+
+/// How far from the pointer the program can touch a cell, in either direction.
+///
+/// The tape is padded by this much on both sides. Multiply loops are replaced
+/// without their check, so they touch their targets even when the counter is 0 and
+/// the loop wouldn't have run. They only add 0 there, and with the padding that's
+/// always memory the program owns.
+fn padding(tokens: &[Token]) -> usize {
+    tokens
+        .iter()
+        .map(|t| match *t.kind() {
+            // A scan checks the cells it steps over in order, so it never reads past
+            // the zero it stops at.
+            TokenKind::Add(_) | TokenKind::Move(_) | TokenKind::Scan(_) => 0,
+            TokenKind::AddAt(offset, _)
+            | TokenKind::Set(offset, _)
+            | TokenKind::Output(offset)
+            | TokenKind::Input(offset)
+            | TokenKind::JmpZ(_, offset)
+            | TokenKind::JmpNZ(_, offset) => offset.unsigned_abs(),
+            TokenKind::MulAt(from, to, _) => from.unsigned_abs().max(to.unsigned_abs()),
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Writes the `len` bytes at `name` to stdout.
@@ -88,8 +116,8 @@ fn first_reachable(tokens: &[Token], index: usize) -> usize {
 
     for (i, token) in tokens[..index].iter().enumerate() {
         match token.kind() {
-            TokenKind::JmpZ(_) => open.push(i),
-            TokenKind::JmpNZ(_) => {
+            TokenKind::JmpZ(..) => open.push(i),
+            TokenKind::JmpNZ(..) => {
                 open.pop();
             }
             _ => (),
@@ -143,9 +171,10 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
         return out;
     };
 
+    let padding = padding(tokens);
     writeln!(
         out,
-        "section .bss\ntape: resb {TAPE_LEN}\noutbuf: resb 4096\n\nsection .text\nglobal _start\n"
+        "section .bss\nresb {padding}\ntape: resb {TAPE_LEN}\nresb {padding}\noutbuf: resb 4096\n\nsection .text\nglobal _start\n"
     )
     .unwrap();
     create_putc(&mut out);
@@ -182,25 +211,29 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
         instr(&mut out, "jmp .resume");
     }
 
-    // Whether the zero flag currently says if the current cell is 0, so the next
-    // loop check can skip its `cmp`. Arithmetic on the cell sets it, and so does a
-    // loop or scan check: every jump into the code after one agrees on the cell.
-    let mut flags_from_cell = false;
+    // The offset of the cell the zero flag currently reflects (0 means it's set), so
+    // the next check of that cell can skip its `cmp`. Arithmetic on a cell sets it,
+    // and so does a loop or scan check: every jump into the code after one agrees.
+    let mut flags_cell: Option<isize> = None;
+    // The cell whose value is in `eax`, so a group of multiplies loads it once.
+    let mut loaded: Option<isize> = None;
     let mut scans = 0;
     let mut prev = None;
 
     for (i, token) in tokens.iter().enumerate().skip(first) {
         if i == resume.index && first < resume.index {
             label(&mut out, ".resume");
-            // Reached by the jump too, so the flags say nothing about the cell.
-            flags_from_cell = false;
+            // Reached by the jump too, so nothing is known about the flags or `eax`.
+            flags_cell = None;
+            loaded = None;
         }
 
         let kind = *token.kind();
-        // A `]` right after the cell was cleared never jumps back (multiply loops
-        // end like this), so it needs no check.
-        let loop_ends_cleared =
-            matches!(kind, TokenKind::JmpNZ(_)) && prev == Some(TokenKind::Set(0, 0));
+        // A `]` right after its cell was cleared never jumps back, so it needs no check.
+        let loop_ends_cleared = match kind {
+            TokenKind::JmpNZ(_, offset) => prev == Some(TokenKind::Set(offset, 0)),
+            _ => false,
+        };
 
         match kind {
             TokenKind::Add(n) => add_cell(&mut out, 0, n),
@@ -208,40 +241,56 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
             TokenKind::Move(n) => move_ptr(&mut out, n),
             TokenKind::Set(offset, n) => instr(&mut out, &format!("mov {}, {n}", cell(offset))),
 
-            TokenKind::MulAt(offset, factor) => {
-                instr(&mut out, "movzx eax, byte [rbx]");
+            TokenKind::MulAt(from, to, factor) => {
+                if loaded != Some(from) {
+                    instr(&mut out, &format!("movzx eax, {}", cell(from)));
+                }
                 match factor {
-                    1 => instr(&mut out, &format!("add {}, al", cell(offset))),
-                    u8::MAX => instr(&mut out, &format!("sub {}, al", cell(offset))),
+                    1 => instr(&mut out, &format!("add {}, al", cell(to))),
+                    u8::MAX => instr(&mut out, &format!("sub {}, al", cell(to))),
                     _ => {
-                        instr(&mut out, &format!("imul eax, eax, {factor}"));
-                        instr(&mut out, &format!("add {}, al", cell(offset)));
+                        instr(&mut out, &format!("imul ecx, eax, {factor}"));
+                        instr(&mut out, &format!("add {}, cl", cell(to)));
                     }
                 }
             }
 
-            // Laid out like a loop: check once on entry, then step and check at the bottom.
+            // Laid out like a loop, checking SCAN_UNROLL cells per iteration. The
+            // pointer moves with `lea`, which leaves the flags alone, so every way out
+            // arrives with the zero flag set by the cell it stopped on.
             TokenKind::Scan(step) => {
-                test_cell(&mut out, flags_from_cell);
-                instr(&mut out, &format!("je .scan_end_{scans}"));
-                label(&mut out, &format!(".scan_{scans}"));
-                move_ptr(&mut out, step);
-                instr(&mut out, "cmp byte [rbx], 0");
-                instr(&mut out, &format!("jne .scan_{scans}"));
-                label(&mut out, &format!(".scan_end_{scans}"));
+                let k = scans;
                 scans += 1;
+
+                test_cell(&mut out, flags_cell, 0);
+                instr(&mut out, &format!("je .scan_end_{k}"));
+                label(&mut out, &format!(".scan_{k}"));
+                for ahead in 1..SCAN_UNROLL {
+                    instr(&mut out, &format!("cmp {}, 0", cell(step * ahead)));
+                    instr(&mut out, &format!("je .scan_{k}_{ahead}"));
+                }
+                instr(&mut out, &format!("lea rbx, [rbx{:+}]", step * SCAN_UNROLL));
+                instr(&mut out, "cmp byte [rbx], 0");
+                instr(&mut out, &format!("jne .scan_{k}"));
+                instr(&mut out, &format!("jmp .scan_end_{k}"));
+                // Found `ahead` cells on: each label steps once and falls into the next.
+                for ahead in (1..SCAN_UNROLL).rev() {
+                    label(&mut out, &format!(".scan_{k}_{ahead}"));
+                    instr(&mut out, &format!("lea rbx, [rbx{step:+}]"));
+                }
+                label(&mut out, &format!(".scan_end_{k}"));
             }
 
             // `[` checks on entry and `]` jumps back to the start of the body, so each
             // iteration runs a single check.
-            TokenKind::JmpZ(n) => {
-                test_cell(&mut out, flags_from_cell);
+            TokenKind::JmpZ(n, offset) => {
+                test_cell(&mut out, flags_cell, offset);
                 instr(&mut out, &format!("je .end_{n}"));
                 label(&mut out, &format!(".loop_{n}"));
             }
-            TokenKind::JmpNZ(n) => {
+            TokenKind::JmpNZ(n, offset) => {
                 if !loop_ends_cleared {
-                    test_cell(&mut out, flags_from_cell);
+                    test_cell(&mut out, flags_cell, offset);
                     instr(&mut out, &format!("jne .loop_{n}"));
                 }
                 label(&mut out, &format!(".end_{n}"));
@@ -252,25 +301,35 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
                 instr(&mut out, "call putc");
             }
 
-            TokenKind::Input => {
+            TokenKind::Input(offset) => {
                 instr(&mut out, "call flush");
 
                 // EOF (or a failed read) leaves the cell at 0.
-                instr(&mut out, "mov byte [rbx], 0");
+                instr(&mut out, &format!("mov {}, 0", cell(offset)));
                 instr(&mut out, "mov rax, 0");
                 instr(&mut out, "mov rdi, 0");
-                instr(&mut out, "mov rsi, rbx");
+                instr(&mut out, &format!("lea rsi, [rbx{offset:+}]"));
                 instr(&mut out, "mov rdx, 1");
                 instr(&mut out, "syscall");
             }
         }
 
-        // Without its check, the code after a `]` is reached with the flags of
-        // whatever the body did last.
-        flags_from_cell = matches!(
-            kind,
-            TokenKind::Add(_) | TokenKind::Scan(_) | TokenKind::JmpZ(_) | TokenKind::JmpNZ(_)
-        ) && !loop_ends_cleared;
+        flags_cell = match kind {
+            TokenKind::Add(_) | TokenKind::Scan(_) => Some(0),
+            TokenKind::AddAt(offset, _) | TokenKind::JmpZ(_, offset) => Some(offset),
+            // Without its check, the code after a `]` is reached with the flags of
+            // whatever the body did last.
+            TokenKind::JmpNZ(_, offset) if !loop_ends_cleared => Some(offset),
+            // The last instruction is the add or sub into the target.
+            TokenKind::MulAt(_, to, _) => Some(to),
+            // `mov` leaves the flags alone, so they still hold for any other cell.
+            TokenKind::Set(offset, _) if flags_cell != Some(offset) => flags_cell,
+            _ => None,
+        };
+        loaded = match kind {
+            TokenKind::MulAt(from, _, _) => Some(from),
+            _ => None,
+        };
         prev = Some(kind);
     }
 

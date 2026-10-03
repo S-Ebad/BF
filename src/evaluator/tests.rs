@@ -36,7 +36,7 @@ fn stops_at_input() {
     assert_eq!(e.output, [3]);
 
     let resume = e.resume.unwrap();
-    assert_eq!(*tokens(src, 0)[resume.index].kind(), TokenKind::Input);
+    assert_eq!(*tokens(src, 0)[resume.index].kind(), TokenKind::Input(0));
     assert_eq!(resume.pointer, 1);
     assert_eq!(resume.tape[..3], [3, 2, 0]);
 }

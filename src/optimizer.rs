@@ -88,13 +88,15 @@ fn collapse_runs(tokens: Vec<Token>) -> Vec<Token> {
 
 /// -O2: turns pointer moves around cell ops into offsets, so `>>++<<` becomes `AddAt(2, 2)`.
 ///
-/// Between two ops that need the real pointer (input, loops, `MulAt`, `Scan`), moves
-/// are only tracked as an offset. Adds, Sets and Outputs get that offset added to
-/// their own, and a single `Move` for the net distance is emitted before the next op
-/// that needs the pointer.
+/// Moves are only tracked as an offset, and every op that works on a cell gets that
+/// offset added to its own. Loops whose body doesn't move the pointer overall get
+/// it too, checking their cell at an offset, so the pointer doesn't move to them and
+/// back. Only `Scan` and loops that do move the pointer need the real pointer: a
+/// single `Move` for the net distance is emitted before them.
 fn fold_offsets(tokens: Vec<Token>) -> Vec<Token> {
     use TokenKind::*;
 
+    let balanced = balanced_loops(&tokens);
     let mut out = Vec::with_capacity(tokens.len());
     // Net distance moved since the pointer was last real, and the first move's token.
     let mut pending: Option<(isize, Token)> = None;
@@ -113,8 +115,12 @@ fn fold_offsets(tokens: Vec<Token>) -> Vec<Token> {
             Add(n) => Some(add_at(base, n)),
             AddAt(offset, n) => Some(add_at(base + offset, n)),
             Set(offset, n) => Some(Set(base + offset, n)),
+            MulAt(from, to, n) => Some(MulAt(base + from, base + to, n)),
             Output(offset) => Some(Output(base + offset)),
-            MulAt(..) | Scan(_) | Input | JmpZ(_) | JmpNZ(_) => None,
+            Input(offset) => Some(Input(base + offset)),
+            JmpZ(id, offset) if balanced[id] => Some(JmpZ(id, base + offset)),
+            JmpNZ(id, offset) if balanced[id] => Some(JmpNZ(id, base + offset)),
+            Scan(_) | JmpZ(..) | JmpNZ(..) => None,
         };
 
         match shifted {
@@ -128,6 +134,53 @@ fn fold_offsets(tokens: Vec<Token>) -> Vec<Token> {
 
     flush_move(&mut out, pending);
     out
+}
+
+/// For each loop id, whether the loop leaves the pointer where it found it.
+///
+/// That's when its body's moves add up to 0, it has no `Scan`, and every loop
+/// inside it is balanced too. Such a loop can run at an offset: the pointer is
+/// the same at the start of every iteration.
+fn balanced_loops(tokens: &[Token]) -> Vec<bool> {
+    let loops = tokens
+        .iter()
+        .filter(|t| matches!(t.kind(), TokenKind::JmpZ(..)))
+        .count();
+    let ids = tokens.iter().filter_map(|t| match t.kind() {
+        TokenKind::JmpZ(id, _) => Some(*id + 1),
+        _ => None,
+    });
+    let mut balanced = vec![false; ids.max().unwrap_or(0).max(loops)];
+    // Net move and whether it can still be balanced, for each open loop.
+    let mut open: Vec<(isize, bool)> = Vec::new();
+
+    for token in tokens {
+        match *token.kind() {
+            TokenKind::JmpZ(..) => open.push((0, true)),
+            TokenKind::Move(n) => {
+                if let Some((net, _)) = open.last_mut() {
+                    *net += n;
+                }
+            }
+            TokenKind::Scan(_) => {
+                if let Some((_, ok)) = open.last_mut() {
+                    *ok = false;
+                }
+            }
+            TokenKind::JmpNZ(id, _) => {
+                let (net, ok) = open.pop().expect("jumps are resolved");
+                balanced[id] = ok && net == 0;
+                if !balanced[id]
+                    && let Some((_, outer_ok)) = open.last_mut()
+                {
+                    *outer_ok = false;
+                }
+            }
+            _ => (),
+        }
+    }
+
+    balanced
 }
 
 /// Emits the net move tracked by `fold_offsets`, keeping the first move's span.
@@ -150,29 +203,21 @@ fn replace_loops(tokens: Vec<Token>) -> Vec<Token> {
     let mut open = Vec::new();
 
     for token in tokens {
-        match token.kind() {
-            TokenKind::JmpZ(_) => {
+        match *token.kind() {
+            TokenKind::JmpZ(..) => {
                 open.push(out.len());
                 push(&mut out, token);
             }
-            TokenKind::JmpNZ(_) => {
+            TokenKind::JmpNZ(_, offset) => {
                 let start = open.pop().expect("jumps are resolved");
-                let span = out[start].span();
 
-                match loop_replacement(&out[start + 1..]) {
-                    Some(Replacement::Unguarded(kinds)) => {
+                match loop_replacement(&out[start + 1..], offset) {
+                    Some(kinds) => {
+                        let span = out[start].span();
                         out.truncate(start);
                         for kind in kinds {
                             push(&mut out, Token::new(kind, span));
                         }
-                    }
-                    Some(Replacement::Guarded(kinds)) => {
-                        // Keep the `[` check and the `]`; the body now runs at most once.
-                        out.truncate(start + 1);
-                        for kind in kinds {
-                            push(&mut out, Token::new(kind, span));
-                        }
-                        push(&mut out, token);
                     }
                     None => push(&mut out, token),
                 }
@@ -184,50 +229,43 @@ fn replace_loops(tokens: Vec<Token>) -> Vec<Token> {
     out
 }
 
-enum Replacement {
-    /// Replaces the whole loop.
-    Unguarded(Vec<TokenKind>),
-    /// Replaces the loop body. The loop's brackets stay, so the new body only runs
-    /// when the cell isn't 0, and it always leaves the cell at 0.
-    Guarded(Vec<TokenKind>),
-}
-
-/// What a loop with this body can be replaced with, if anything.
-fn loop_replacement(body: &[Token]) -> Option<Replacement> {
+/// What a loop checking the cell at `offset`, with this body, can be replaced with.
+fn loop_replacement(body: &[Token], offset: isize) -> Option<Vec<TokenKind>> {
     use TokenKind::*;
 
     match body.iter().map(|t| *t.kind()).collect::<Vec<_>>()[..] {
-        // `[>]`, `[<<]`: find the next zero cell.
-        [Move(step)] => Some(Replacement::Unguarded(vec![Scan(step)])),
+        // `[>]`, `[<<]`: find the next zero cell. A body that moves is never at an offset.
+        [Move(step)] => Some(vec![Scan(step)]),
         // `[[-]]`: the inner loop already clears the cell.
-        [Set(0, 0)] => Some(Replacement::Unguarded(vec![Set(0, 0)])),
-        _ => multiply_loop(body),
+        [Set(cell, 0)] if cell == offset => Some(vec![Set(offset, 0)]),
+        _ => multiply_loop(body, offset),
     }
 }
 
 /// Matches clear and multiply loops: bodies that only add constants, with no net move.
 ///
-/// The loop runs until the counter (offset 0) reaches 0, adding the same amount to
-/// each target every time. With an odd step, that count is fixed by the counter's
-/// value, so `[->++<]` becomes `[MulAt(1, 2), Set(0, 0)]`. A body without targets is
-/// a clear loop. Even steps can loop forever (`[--]` on an odd cell), so they stay loops.
+/// The loop runs until the counter (the cell at `offset`) reaches 0, adding the same
+/// amount to each target every time. With an odd step, that count is fixed by the
+/// counter's value, so `[->++<]` becomes `MulAt(0, 1, 2), Set(0, 0)`. A body
+/// without targets is a clear loop. Even steps can loop forever (`[--]` on an odd
+/// cell), so they stay loops.
 ///
-/// Multiplies stay guarded by the loop's `[`: when the counter is 0 the original loop
-/// never touches its targets, and those can be outside the tape (Mandelbrot does this
-/// near the start of the tape).
-fn multiply_loop(body: &[Token]) -> Option<Replacement> {
+/// When the counter is 0, the replacement still touches the targets (adding 0) where
+/// the loop wouldn't have run at all. Those cells can be off the tape, so codegen
+/// pads the tape on both sides by the largest offset in the program.
+fn multiply_loop(body: &[Token], offset: isize) -> Option<Vec<TokenKind>> {
     let mut step = 0u8;
     let mut targets: Vec<(isize, u8)> = Vec::new();
 
     for token in body {
-        let (offset, n) = as_add(*token.kind())?;
+        let (cell, n) = as_add(*token.kind())?;
 
-        if offset == 0 {
+        if cell == offset {
             step = step.wrapping_add(n);
-        } else if let Some((_, total)) = targets.iter_mut().find(|(o, _)| *o == offset) {
+        } else if let Some((_, total)) = targets.iter_mut().find(|(c, _)| *c == cell) {
             *total = total.wrapping_add(n);
         } else {
-            targets.push((offset, n));
+            targets.push((cell, n));
         }
     }
 
@@ -244,24 +282,20 @@ fn multiply_loop(body: &[Token]) -> Option<Replacement> {
 
     let mut kinds: Vec<TokenKind> = targets
         .into_iter()
-        .map(|(offset, n)| TokenKind::MulAt(offset, n.wrapping_mul(per_unit)))
-        .filter(|kind| !matches!(kind, TokenKind::MulAt(_, 0)))
+        .map(|(cell, n)| TokenKind::MulAt(offset, cell, n.wrapping_mul(per_unit)))
+        .filter(|kind| !matches!(kind, TokenKind::MulAt(_, _, 0)))
         .collect();
+    kinds.push(TokenKind::Set(offset, 0));
 
-    if kinds.is_empty() {
-        return Some(Replacement::Unguarded(vec![TokenKind::Set(0, 0)]));
-    }
-
-    kinds.push(TokenKind::Set(0, 0));
-    Some(Replacement::Guarded(kinds))
+    Some(kinds)
 }
 
 /// -O2: removes loops that can never run, because the current cell is known to be 0.
 ///
-/// That's the case at the start of the program, right after a loop or `Scan` (both
-/// only end on a zero cell), and after `Set(0, 0)`. This also drops comment loops,
-/// like the header many programs start with. A `Set(0, 0)` on a known-zero cell is
-/// dropped too.
+/// That's the case at the start of the program, right after a loop on the current
+/// cell or a `Scan` (both only end on a zero cell), and after `Set(0, 0)`. This also
+/// drops comment loops, like the header many programs start with. A `Set(0, 0)` on
+/// a known-zero cell is dropped too.
 fn remove_dead_loops(tokens: Vec<Token>) -> Vec<Token> {
     use TokenKind::*;
 
@@ -273,9 +307,11 @@ fn remove_dead_loops(tokens: Vec<Token>) -> Vec<Token> {
         let kind = *token.kind();
 
         match kind {
-            JmpZ(id) if known_zero => {
+            JmpZ(id, 0) if known_zero => {
                 // Skip everything up to and including this loop's `]`.
-                tokens.by_ref().find(|t| *t.kind() == JmpNZ(id));
+                tokens
+                    .by_ref()
+                    .find(|t| matches!(*t.kind(), JmpNZ(end, _) if end == id));
                 continue;
             }
             Set(0, 0) if known_zero => continue,
@@ -283,11 +319,13 @@ fn remove_dead_loops(tokens: Vec<Token>) -> Vec<Token> {
         }
 
         known_zero = match kind {
-            JmpNZ(_) | Scan(_) => true,
+            JmpNZ(_, 0) | Scan(_) => true,
             Set(0, n) => n == 0,
+            // A loop on another cell may change this one.
+            Add(_) | Move(_) | Input(0) | JmpZ(..) | JmpNZ(..) => false,
+            MulAt(_, to, _) => known_zero && to != 0,
             // These don't touch the current cell.
-            AddAt(..) | Set(..) | MulAt(..) | Output(_) => known_zero,
-            Add(_) | Move(_) | Input | JmpZ(_) => false,
+            AddAt(..) | Set(..) | Output(_) | Input(_) => known_zero,
         };
 
         push(&mut out, token);

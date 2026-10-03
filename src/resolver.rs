@@ -11,13 +11,13 @@ pub fn resolve_jumps(tokens: &mut [Token]) -> Result<(), Vec<BFError>> {
 
     for token in tokens.iter_mut() {
         match token.kind_mut() {
-            TokenKind::JmpZ(n) => {
+            TokenKind::JmpZ(n, _) => {
                 *n = counter;
                 open_loops.push((*n, token.span()));
 
                 counter += 1;
             }
-            TokenKind::JmpNZ(n) => {
+            TokenKind::JmpNZ(n, _) => {
                 if let Some((open, _)) = open_loops.pop() {
                     *n = open;
                 } else {

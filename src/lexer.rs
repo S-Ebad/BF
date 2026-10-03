@@ -10,19 +10,26 @@ pub enum TokenKind {
     AddAt(isize, u8),
     /// Set the cell at this offset to this value (only made by -O2). `[-]` is `Set(0, 0)`.
     Set(isize, u8),
-    /// Add the current cell times this factor to the cell at this offset (only made by -O2).
+    /// `MulAt(from, to, factor)`: add the cell at `from` times `factor` to the cell at
+    /// `to`, both offsets from the pointer (only made by -O2).
     ///
-    /// Multiply loops like `[->++<]` become a `MulAt` per target, then `Set(0, 0)`.
-    MulAt(isize, u8),
+    /// Multiply loops like `[->++<]` become a `MulAt` per target, then a `Set` of the counter.
+    MulAt(isize, isize, u8),
     /// Move the pointer by this step until it lands on a zero cell (only made by -O2).
     ///
     /// `[>]` is `Scan(1)`, `[<<]` is `Scan(-2)`.
     Scan(isize),
     /// Print the cell at this offset (`.` is `Output(0)`).
     Output(isize),
-    Input,
-    JmpZ(usize),
-    JmpNZ(usize),
+    /// Read a byte into the cell at this offset (`,` is `Input(0)`).
+    Input(isize),
+    /// `JmpZ(id, offset)`: `[`, checking the cell at this offset.
+    ///
+    /// The offset is only non-zero for loops whose body doesn't move the pointer
+    /// overall, which -O2 runs without moving the pointer to them.
+    JmpZ(usize, isize),
+    /// `JmpNZ(id, offset)`: `]`, checking the cell at this offset.
+    JmpNZ(usize, isize),
 }
 
 #[derive(Debug)]
@@ -57,9 +64,9 @@ impl TokenKind {
             '>' => Some(Self::Move(1)),
             '<' => Some(Self::Move(-1)),
             '.' => Some(Self::Output(0)),
-            ',' => Some(Self::Input),
-            '[' => Some(Self::JmpZ(0)),
-            ']' => Some(Self::JmpNZ(0)),
+            ',' => Some(Self::Input(0)),
+            '[' => Some(Self::JmpZ(0, 0)),
+            ']' => Some(Self::JmpNZ(0, 0)),
             _ => None,
         }
     }
