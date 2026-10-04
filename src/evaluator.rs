@@ -21,7 +21,7 @@ pub struct Resume {
     /// The pointer, as a cell index. It can be off the tape if the program moved
     /// there without touching a cell yet.
     pub pointer: isize,
-    /// The start of the tape, up to the last cell the program touched. The rest is 0.
+    /// The start of the tape, up to the last cell that isn't 0. The rest is 0.
     pub tape: Vec<u8>,
 }
 
@@ -50,8 +50,10 @@ pub fn evaluate(tokens: &[Token], step_limit: u64, tape_size: usize) -> Evaluati
     use TokenKind::*;
 
     let partner = match_loops(tokens);
-    // Only as long as the program has used so far, so a huge tape costs nothing here.
-    let mut tape: Vec<u8> = Vec::new();
+    // Tapes up to this size are allocated whole (the OS only backs the pages that get
+    // used), so accesses never have to grow it. Larger ones grow as they're used.
+    const ALLOCATED: usize = 1 << 24;
+    let mut tape: Vec<u8> = vec![0; tape_size.min(ALLOCATED)];
     let mut pointer: isize = 0;
     let mut output = Vec::new();
     let mut index = 0;
@@ -151,6 +153,12 @@ pub fn evaluate(tokens: &[Token], step_limit: u64, tape_size: usize) -> Evaluati
 
         index += 1;
     }
+
+    let used = tape
+        .iter()
+        .rposition(|&c| c != 0)
+        .map_or(0, |last| last + 1);
+    tape.truncate(used);
 
     let resume = (index < tokens.len()).then_some(Resume {
         index,
