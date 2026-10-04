@@ -6,11 +6,11 @@ use crate::resolver::resolve_jumps;
 fn tokens(src: &str, level: u8) -> Vec<Token> {
     let mut tokens = tokenize(src);
     resolve_jumps(&mut tokens).unwrap_or_else(|_| panic!("unbalanced: {src:?}"));
-    optimize(tokens, level)
+    optimize(tokens, level, false)
 }
 
 fn eval(src: &str, level: u8, step_limit: u64) -> Evaluation {
-    evaluate(&tokens(src, level), step_limit)
+    evaluate(&tokens(src, level), step_limit, 30000)
 }
 
 #[test]
@@ -42,7 +42,8 @@ fn stops_at_input() {
     let resume = e.resume.unwrap();
     assert_eq!(*tokens(src, 0)[resume.index].kind(), TokenKind::Input(0));
     assert_eq!(resume.pointer, 1);
-    assert_eq!(resume.tape[..3], [3, 2, 0]);
+    // Only the cells used so far: the rest of the tape is 0.
+    assert_eq!(resume.tape, [3, 2]);
 }
 
 #[test]
@@ -92,7 +93,7 @@ fn scans_stop_partway() {
 
     let tokens = tokens(src, 2);
     let scan = tokens.len() - 1;
-    let stopped = evaluate(&tokens, scan as u64 + 3).resume.unwrap();
+    let stopped = evaluate(&tokens, scan as u64 + 3, 30000).resume.unwrap();
     assert_eq!(stopped.index, scan);
     assert_eq!(stopped.pointer, 3);
 }
@@ -105,4 +106,27 @@ fn optimized_ops_match_their_loops() {
     let optimized = eval(src, 2, DEFAULT_STEP_LIMIT);
     assert_eq!(plain.output, optimized.output);
     assert!(optimized.resume.is_none());
+}
+
+#[test]
+fn tape_size_is_respected() {
+    // Cell 4 is the last one on a 5-cell tape; cell 5 is off it.
+    let e = evaluate(&tokens(">>>>+.>+.", 0), DEFAULT_STEP_LIMIT, 5);
+    assert_eq!(e.output, [1]);
+    let resume = e.resume.unwrap();
+    assert_eq!(resume.pointer, 5);
+
+    // A huge tape costs nothing: only the used part exists.
+    let e = evaluate(&tokens(">>+.", 0), DEFAULT_STEP_LIMIT, i32::MAX as usize);
+    assert!(e.resume.is_none());
+}
+
+#[test]
+fn scans_stop_before_stepping_off_the_tape() {
+    // The scan would step from cell 0 to -1; it stops on cell 0 instead, so the
+    // compiled program takes that step (and checks it).
+    let tokens = tokens("+[<]", 2);
+    let resume = evaluate(&tokens, DEFAULT_STEP_LIMIT, 30000).resume.unwrap();
+    assert_eq!(*tokens[resume.index].kind(), TokenKind::Scan(-1));
+    assert_eq!(resume.pointer, 0);
 }

@@ -4,7 +4,12 @@ use crate::lexer::{Token, TokenKind};
 ///
 /// Expects resolved jumps. Loop ids are labels, so passes can drop tokens freely
 /// as long as a loop's `[` and `]` are kept or dropped together.
-pub fn optimize(mut tokens: Vec<Token>, level: u8) -> Vec<Token> {
+///
+/// With `guard_multiplies`, multiply loops keep their brackets, so their targets are
+/// only touched (and checked) when the loop would have run. That's needed with
+/// `--bounds abort`, where the tape has no padding for a multiply that doesn't run
+/// to touch.
+pub fn optimize(mut tokens: Vec<Token>, level: u8, guard_multiplies: bool) -> Vec<Token> {
     if level >= 1 {
         tokens = collapse_runs(tokens);
     }
@@ -12,13 +17,60 @@ pub fn optimize(mut tokens: Vec<Token>, level: u8) -> Vec<Token> {
     if level >= 2 {
         // Loop patterns are matched on folded bodies, where a copy loop is just adds.
         tokens = fold_offsets(tokens);
-        tokens = replace_loops(tokens);
+        tokens = replace_loops(tokens, guard_multiplies);
         // Fold again so the Sets and Outputs that replaced loops get offsets too.
         tokens = fold_offsets(tokens);
         tokens = remove_dead_loops(tokens);
     }
 
     tokens
+}
+
+/// For `--bounds abort`, and only then: puts a `Check` in front of every stretch of
+/// the source as written that reads or writes a cell, with the range of cells it
+/// touches.
+///
+/// A stretch runs up to and including the next loop bracket or I/O, which touch the
+/// cell they're on too. Nothing in a stretch is visible from outside until its last
+/// token, so checking the whole stretch at its start aborts at the same point as
+/// checking each access. Runs before optimizing, on the tokens straight from the
+/// lexer, so the checks cover accesses the optimizer later removes.
+pub fn insert_access_checks(tokens: Vec<Token>) -> Vec<Token> {
+    use TokenKind::*;
+
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut stretch: Vec<Token> = Vec::new();
+    // Where the pointer is, from the start of the stretch, and the cells touched.
+    let mut offset = 0isize;
+    let mut touched: Option<(isize, isize)> = None;
+
+    let end_stretch =
+        |out: &mut Vec<Token>, stretch: &mut Vec<Token>, touched: &mut Option<(isize, isize)>| {
+            if let (Some((min, max)), Some(first)) = (touched.take(), stretch.first()) {
+                out.push(Token::new(Check(min, max), first.span()));
+            }
+            out.append(stretch);
+        };
+
+    for token in tokens {
+        let kind = *token.kind();
+        if let Move(n) = kind {
+            offset += n;
+        } else {
+            touched = Some(touched.map_or((offset, offset), |(lo, hi)| {
+                (lo.min(offset), hi.max(offset))
+            }));
+        }
+        stretch.push(token);
+
+        if matches!(kind, Output(_) | Input(_) | JmpZ(..) | JmpNZ(..)) {
+            end_stretch(&mut out, &mut stretch, &mut touched);
+            offset = 0;
+        }
+    }
+    end_stretch(&mut out, &mut stretch, &mut touched);
+
+    out
 }
 
 /// `Add(n)` and `AddAt(offset, n)` as one shape: an add at an offset.
@@ -52,6 +104,9 @@ fn push(out: &mut Vec<Token>, token: Token) {
     let (a, b) = (*last.kind(), *token.kind());
     let merged = match (a, b) {
         (Move(x), Move(y)) => Move(x + y),
+        // Two checks at the same pointer: one check of both ranges fails exactly when
+        // one of them would have, before anything visible happens either way.
+        (Check(a, b), Check(c, d)) => Check(a.min(c), b.max(d)),
         _ => match (as_add(a), as_add(b), a, b) {
             (Some((i, x)), Some((j, y)), _, _) if i == j => add_at(i, x.wrapping_add(y)),
             (_, Some((j, y)), Set(i, x), _) if i == j => Set(i, x.wrapping_add(y)),
@@ -118,6 +173,7 @@ fn fold_offsets(tokens: Vec<Token>) -> Vec<Token> {
             MulAt(from, to, n) => Some(MulAt(base + from, base + to, n)),
             Output(offset) => Some(Output(base + offset)),
             Input(offset) => Some(Input(base + offset)),
+            Check(min, max) => Some(Check(base + min, base + max)),
             JmpZ(id, offset) if balanced[id] => Some(JmpZ(id, base + offset)),
             JmpNZ(id, offset) if balanced[id] => Some(JmpNZ(id, base + offset)),
             Scan(_) | JmpZ(..) | JmpNZ(..) => None,
@@ -197,7 +253,7 @@ fn flush_move(out: &mut Vec<Token>, pending: Option<(isize, Token)>) {
 ///
 /// Patterns are checked when a loop's `]` arrives, so inner loops are already
 /// replaced by the time their outer loop is checked.
-fn replace_loops(tokens: Vec<Token>) -> Vec<Token> {
+fn replace_loops(tokens: Vec<Token>, guard_multiplies: bool) -> Vec<Token> {
     let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
     // Index in `out` of each open loop's `[`.
     let mut open = Vec::new();
@@ -214,9 +270,20 @@ fn replace_loops(tokens: Vec<Token>) -> Vec<Token> {
                 match loop_replacement(&out[start + 1..], offset) {
                     Some(kinds) => {
                         let span = out[start].span();
-                        out.truncate(start);
+                        let guard = guard_multiplies
+                            && kinds
+                                .iter()
+                                .any(|k| matches!(k, TokenKind::MulAt(..) | TokenKind::Check(..)));
+
+                        // A guarded multiply keeps its `[` and `]`, so it only touches its
+                        // targets (and only checks them) when the loop would have run. It
+                        // ends with a Set of the counter to 0, so the `]` never jumps back.
+                        out.truncate(if guard { start + 1 } else { start });
                         for kind in kinds {
                             push(&mut out, Token::new(kind, span));
+                        }
+                        if guard {
+                            push(&mut out, token);
                         }
                     }
                     None => push(&mut out, token),
@@ -230,16 +297,40 @@ fn replace_loops(tokens: Vec<Token>) -> Vec<Token> {
 }
 
 /// What a loop checking the cell at `offset`, with this body, can be replaced with.
+///
+/// With `--bounds abort` the body has `Check`s for the cells it touches. They don't
+/// change what the loop does, so patterns are matched without them, and their range
+/// is kept in front of a replacement that touches those cells.
 fn loop_replacement(body: &[Token], offset: isize) -> Option<Vec<TokenKind>> {
     use TokenKind::*;
 
-    match body.iter().map(|t| *t.kind()).collect::<Vec<_>>()[..] {
-        // `[>]`, `[<<]`: find the next zero cell. A body that moves is never at an offset.
-        [Move(step)] => Some(vec![Scan(step)]),
-        // `[[-]]`: the inner loop already clears the cell.
-        [Set(cell, 0)] if cell == offset => Some(vec![Set(offset, 0)]),
-        _ => multiply_loop(body, offset),
+    let mut checked: Option<(isize, isize)> = None;
+    let mut ops: Vec<Token> = Vec::with_capacity(body.len());
+    for token in body {
+        match *token.kind() {
+            Check(min, max) => {
+                checked = Some(checked.map_or((min, max), |(lo, hi)| (lo.min(min), hi.max(max))));
+            }
+            _ => ops.push(Token::new(*token.kind(), token.span())),
+        }
     }
+
+    let mut kinds = match ops.iter().map(|t| *t.kind()).collect::<Vec<_>>()[..] {
+        // `[>]`, `[<<]`: find the next zero cell. A body that moves is never at an
+        // offset. With `--bounds abort` a scan checks every cell it steps onto itself.
+        [Move(step)] => return Some(vec![Scan(step)]),
+        // `[[-]]`: the inner loop already clears the cell.
+        [Set(cell, 0)] if cell == offset => vec![Set(offset, 0)],
+        _ => multiply_loop(&ops, offset)?,
+    };
+
+    // The loop's own cell was already checked by the `[` before it.
+    if let Some((min, max)) = checked
+        && (min, max) != (offset, offset)
+    {
+        kinds.insert(0, Check(min, max));
+    }
+    Some(kinds)
 }
 
 /// Matches clear and multiply loops: bodies that only add constants, with no net move.
@@ -325,7 +416,7 @@ fn remove_dead_loops(tokens: Vec<Token>) -> Vec<Token> {
             Add(_) | Move(_) | Input(0) | JmpZ(..) | JmpNZ(..) => false,
             MulAt(_, to, _) => known_zero && to != 0,
             // These don't touch the current cell.
-            AddAt(..) | Set(..) | Output(_) | Input(_) => known_zero,
+            AddAt(..) | Set(..) | Output(_) | Input(_) | Check(..) => known_zero,
         };
 
         push(&mut out, token);

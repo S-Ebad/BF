@@ -1,11 +1,39 @@
 use crate::{
+    cli::Bounds,
     evaluator::Evaluation,
     lexer::{Token, TokenKind},
 };
 use std::fmt::Write;
 
-/// Number of cells on the tape.
-pub const TAPE_LEN: usize = 30000;
+/// Number of cells on the tape, unless `--tape-size` says otherwise.
+pub const DEFAULT_TAPE_SIZE: usize = 30000;
+
+/// The tape the compiled program runs on.
+#[derive(Clone, Copy, Debug)]
+pub struct Tape {
+    /// Number of cells.
+    pub size: usize,
+    /// What happens when the program touches a cell outside the tape.
+    pub bounds: Bounds,
+}
+
+impl Default for Tape {
+    fn default() -> Self {
+        Self {
+            size: DEFAULT_TAPE_SIZE,
+            bounds: Bounds::Undefined,
+        }
+    }
+}
+
+impl Tape {
+    /// Whether leaving the tape is defined (`abort` or `wrap`). Then the tape has no
+    /// padding, and the optimizations that assume plain offsets from the pointer
+    /// (unrolled loops and scans) are off.
+    fn checked(self) -> bool {
+        self.bounds != Bounds::Undefined
+    }
+}
 
 // helpers to format instructions
 fn instr(out: &mut String, code: &str) {
@@ -24,9 +52,65 @@ fn cell(offset: isize) -> String {
     }
 }
 
+/// The address of the cell at `offset` from the pointer, `rbx` or `rbx+3`.
+fn rbx_address(offset: isize) -> String {
+    match offset {
+        0 => "rbx".to_string(),
+        _ => format!("rbx{offset:+}"),
+    }
+}
+
+/// The address of the cell at `offset` from the pointer, emitting what `--bounds`
+/// needs before the cell can be used: for `wrap` the address wrapped onto the tape,
+/// which is then in `rdx` (so use it before the next access), changing the flags.
+///
+/// With `abort`, the `Check` tokens in front of every stretch already made sure the
+/// cells it touches are on the tape, so like `undefined` it's just the offset.
+fn address(out: &mut String, state: &mut State, tape: Tape, offset: isize) -> String {
+    match tape.bounds {
+        Bounds::Undefined | Bounds::Abort => rbx_address(offset),
+        // The pointer is always kept on the tape, so only offsets can leave it.
+        Bounds::Wrap if offset == 0 => rbx_address(0),
+        Bounds::Wrap => {
+            instr(out, &format!("lea rdx, [{}]", rbx_address(offset)));
+            instr(out, "sub rdx, r13");
+            instr(out, "call wrap_index");
+            state.flags_cell = None;
+            "r13+rdx".to_string()
+        }
+    }
+}
+
+/// With `--bounds abort`: jumps to `out_of_bounds` unless the cells from `min` to
+/// `max` (offsets from the pointer) are all on the tape. Changes the flags.
+fn check_range(out: &mut String, tape: Tape, min: isize, max: isize) {
+    let span = (max - min).unsigned_abs();
+    if span >= tape.size {
+        // They can't all fit on the tape.
+        instr(out, "jmp out_of_bounds");
+        return;
+    }
+    // One unsigned comparison: the first cell's index must be within
+    // `0..=size-1-span`, which also puts the last one within the tape.
+    instr(out, &format!("lea rdx, [{}]", rbx_address(min)));
+    instr(out, "sub rdx, r13");
+    instr(out, &format!("cmp rdx, {}", tape.size - span));
+    instr(out, "jae out_of_bounds");
+}
+
+/// With `--bounds wrap`, brings the pointer back onto the tape after it moved.
+fn wrap_pointer(out: &mut String, tape: Tape) {
+    if tape.bounds == Bounds::Wrap {
+        instr(out, "mov rdx, rbx");
+        instr(out, "sub rdx, r13");
+        instr(out, "call wrap_index");
+        instr(out, "lea rbx, [r13+rdx]");
+    }
+}
+
 /// Adds `n` to the cell at `offset`. Sets the zero flag from the result.
-fn add_cell(out: &mut String, offset: isize, n: u8) {
-    let cell = cell(offset);
+fn add_cell(out: &mut String, state: &mut State, tape: Tape, offset: isize, n: u8) {
+    let cell = format!("byte [{}]", address(out, state, tape, offset));
 
     match n {
         1 => instr(out, &format!("inc {cell}")),
@@ -46,9 +130,10 @@ fn move_ptr(out: &mut String, n: isize) {
 }
 
 /// Sets the zero flag from the cell at `offset`, unless it already reflects that cell.
-fn test_cell(out: &mut String, flags_cell: Option<isize>, offset: isize) {
-    if flags_cell != Some(offset) {
-        instr(out, &format!("cmp {}, 0", cell(offset)));
+fn test_cell(out: &mut String, state: &mut State, tape: Tape, offset: isize) {
+    if state.flags_cell != Some(offset) {
+        let address = address(out, state, tape, offset);
+        instr(out, &format!("cmp byte [{address}], 0"));
     }
 }
 
@@ -72,45 +157,50 @@ impl State {
             loaded: self.loaded.map(|offset| offset - n),
         }
     }
+
+    /// The knowledge left when only the flags are known: right after a label,
+    /// where the code can be reached from elsewhere.
+    fn flags_from(offset: isize) -> Self {
+        Self {
+            flags_cell: Some(offset),
+            ..Self::default()
+        }
+    }
 }
 
 /// Emits an op that works on cells, with every offset `shift` cells further on.
 ///
 /// Returns false for ops that aren't straight-line cell ops.
-fn cell_op(out: &mut String, state: &mut State, kind: TokenKind, shift: isize) -> bool {
+fn cell_op(out: &mut String, state: &mut State, tape: Tape, kind: TokenKind, shift: isize) -> bool {
     match kind {
         TokenKind::Add(n) => {
-            add_cell(out, shift, n);
-            *state = State {
-                flags_cell: Some(shift),
-                loaded: None,
-            };
+            add_cell(out, state, tape, shift, n);
+            state.flags_cell = Some(shift);
+            state.loaded = None;
         }
         TokenKind::AddAt(offset, n) => {
-            add_cell(out, offset + shift, n);
-            *state = State {
-                flags_cell: Some(offset + shift),
-                loaded: None,
-            };
+            add_cell(out, state, tape, offset + shift, n);
+            state.flags_cell = Some(offset + shift);
+            state.loaded = None;
         }
         TokenKind::MulAt(from, to, factor) => {
             let (from, to) = (from + shift, to + shift);
             if state.loaded != Some(from) {
-                instr(out, &format!("movzx eax, {}", cell(from)));
+                let address = address(out, state, tape, from);
+                instr(out, &format!("movzx eax, byte [{address}]"));
             }
+            if !matches!(factor, 1 | u8::MAX) {
+                instr(out, &format!("imul ecx, eax, {factor}"));
+            }
+            let target = format!("byte [{}]", address(out, state, tape, to));
             match factor {
-                1 => instr(out, &format!("add {}, al", cell(to))),
-                u8::MAX => instr(out, &format!("sub {}, al", cell(to))),
-                _ => {
-                    instr(out, &format!("imul ecx, eax, {factor}"));
-                    instr(out, &format!("add {}, cl", cell(to)));
-                }
+                1 => instr(out, &format!("add {target}, al")),
+                u8::MAX => instr(out, &format!("sub {target}, al")),
+                _ => instr(out, &format!("add {target}, cl")),
             }
             // The last instruction is the add or sub into the target.
-            *state = State {
-                flags_cell: Some(to),
-                loaded: Some(from),
-            };
+            state.flags_cell = Some(to);
+            state.loaded = Some(from);
         }
         _ => return false,
     }
@@ -121,7 +211,20 @@ fn cell_op(out: &mut String, state: &mut State, kind: TokenKind, shift: isize) -
 /// 9 cells to 0 is a `qword` store and a `byte` store instead of 9 `byte` stores.
 ///
 /// `sets` are in program order; a later set of the same cell wins.
-fn set_cells(out: &mut String, state: &mut State, sets: &[(isize, u8)], shift: isize) {
+fn set_cells(out: &mut String, state: &mut State, tape: Tape, sets: &[(isize, u8)], shift: isize) {
+    // With `--bounds wrap` every cell is wrapped on its own.
+    if tape.bounds == Bounds::Wrap {
+        for &(offset, n) in sets {
+            let address = address(out, state, tape, offset + shift);
+            instr(out, &format!("mov byte [{address}], {n}"));
+            if state.flags_cell == Some(offset + shift) {
+                state.flags_cell = None;
+            }
+        }
+        state.loaded = None;
+        return;
+    }
+
     let mut cells: Vec<(isize, u8)> = Vec::with_capacity(sets.len());
     for &(offset, n) in sets {
         let offset = offset + shift;
@@ -198,7 +301,9 @@ fn padding(tokens: &[Token]) -> usize {
             | TokenKind::Input(offset)
             | TokenKind::JmpZ(_, offset)
             | TokenKind::JmpNZ(_, offset) => offset.unsigned_abs(),
-            TokenKind::MulAt(from, to, _) => from.unsigned_abs().max(to.unsigned_abs()),
+            TokenKind::MulAt(from, to, _) | TokenKind::Check(from, to) => {
+                from.unsigned_abs().max(to.unsigned_abs())
+            }
         })
         .max()
         .unwrap_or(0)
@@ -334,13 +439,13 @@ fn unrolled_loop(
         format!(".half_{n}")
     };
 
-    test_cell(out, state.flags_cell, offset);
+    // Only used without checked bounds.
+    let tape = Tape::default();
+
+    test_cell(out, state, tape, offset);
     instr(out, &format!("je .end_{n}"));
     label(out, &format!(".loop_{n}"));
-    *state = State {
-        flags_cell: Some(offset),
-        loaded: None,
-    };
+    *state = State::flags_from(offset);
 
     for shift in [0, step] {
         let mut sets = Vec::new();
@@ -349,18 +454,18 @@ fn unrolled_loop(
                 TokenKind::Set(cell, value) => sets.push((cell, value)),
                 kind => {
                     if !sets.is_empty() {
-                        set_cells(out, state, &std::mem::take(&mut sets), shift);
+                        set_cells(out, state, tape, &std::mem::take(&mut sets), shift);
                     }
-                    cell_op(out, state, kind, shift);
+                    cell_op(out, state, tape, kind, shift);
                 }
             }
         }
         if !sets.is_empty() {
-            set_cells(out, state, &sets, shift);
+            set_cells(out, state, tape, &sets, shift);
         }
 
         if shift == 0 {
-            test_cell(out, state.flags_cell, offset + step);
+            test_cell(out, state, tape, offset + step);
             instr(out, &format!("je {half_exit}"));
         }
     }
@@ -369,7 +474,7 @@ fn unrolled_loop(
         instr(out, &format!("lea rbx, [rbx{:+}]", 2 * step));
         *state = state.moved(2 * step);
     }
-    test_cell(out, state.flags_cell, offset);
+    test_cell(out, state, tape, offset);
     instr(out, &format!("jne .loop_{n}"));
 
     if step != 0 {
@@ -380,10 +485,53 @@ fn unrolled_loop(
         instr(out, &format!("lea rbx, [rbx{step:+}]"));
     }
     label(out, &format!(".end_{n}"));
-    *state = State {
-        flags_cell: Some(offset),
-        loaded: None,
-    };
+    *state = State::flags_from(offset);
+}
+
+/// With checked bounds: `out_of_bounds` (jumped to by `--bounds abort` checks) prints
+/// what went wrong after the output so far and exits with code 1; `wrap_index`
+/// (called by `--bounds wrap`) brings a cell index in `rdx` onto the tape.
+fn create_bounds_routines(out: &mut String, tape: Tape) {
+    match tape.bounds {
+        Bounds::Undefined => {}
+        Bounds::Abort => {
+            label(out, "out_of_bounds");
+            instr(out, "call flush");
+            instr(out, "mov eax, 1");
+            instr(out, "mov edi, 2");
+            instr(out, "lea rsi, [rel bounds_message]");
+            instr(out, &format!("mov edx, {}", bounds_message(tape).len()));
+            instr(out, "syscall");
+            instr(out, "mov eax, 60");
+            instr(out, "mov edi, 1");
+            instr(out, "syscall");
+        }
+        Bounds::Wrap => {
+            let size = tape.size;
+            label(out, "wrap_index");
+            instr(out, "test rdx, rdx");
+            instr(out, "jns .high");
+            label(out, ".low");
+            instr(out, &format!("add rdx, {size}"));
+            instr(out, "js .low");
+            label(out, ".high");
+            instr(out, &format!("cmp rdx, {size}"));
+            instr(out, "jb .done");
+            instr(out, &format!("sub rdx, {size}"));
+            instr(out, "jmp .high");
+            label(out, ".done");
+            instr(out, "ret");
+        }
+    }
+}
+
+/// What `--bounds abort` prints.
+fn bounds_message(tape: Tape) -> Vec<u8> {
+    format!(
+        "error: the program touched a cell outside the tape (cells 0 to {})\n",
+        tape.size - 1
+    )
+    .into_bytes()
 }
 
 /// `putc` appends `cl` to the output buffer, flushing it when full.
@@ -411,7 +559,7 @@ fn create_putc(out: &mut String) {
 
 /// Generates the program, starting from `start`: the state the program is in
 /// after running part of it at compile time (-O3), or the initial state.
-pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
+pub fn generate(tokens: &[Token], start: &Evaluation, tape: Tape) -> String {
     let mut out = String::new();
     let output = &start.output;
 
@@ -432,13 +580,17 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
         return out;
     };
 
-    let padding = padding(tokens);
+    // Only `undefined` needs padding: there, multiply loops touch their targets even
+    // when they don't run. `abort` keeps them guarded and `wrap` wraps every access.
+    let padding = if tape.checked() { 0 } else { padding(tokens) };
+    let size = tape.size;
     writeln!(
         out,
-        "section .bss\nresb {padding}\ntape: resb {TAPE_LEN}\nresb {padding}\noutbuf: resb 4096\n\nsection .text\nglobal _start\n"
+        "section .bss\nresb {padding}\ntape: resb {size}\nresb {padding}\noutbuf: resb 4096\n\nsection .text\nglobal _start\n"
     )
     .unwrap();
     create_putc(&mut out);
+    create_bounds_routines(&mut out, tape);
 
     label(&mut out, "_start");
 
@@ -458,9 +610,13 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
         instr(&mut out, "rep movsb");
     }
 
+    if tape.checked() {
+        instr(&mut out, "lea r13, [rel tape]");
+    }
     instr(&mut out, "lea rbx, [rel tape]");
     if resume.pointer != 0 {
         move_ptr(&mut out, resume.pointer);
+        wrap_pointer(&mut out, tape);
     }
     instr(&mut out, "xor r12d, r12d");
 
@@ -491,7 +647,7 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
         let kind = *tokens[i].kind();
         let just_cleared = std::mem::take(&mut cleared);
 
-        if cell_op(&mut out, &mut state, kind, 0) {
+        if cell_op(&mut out, &mut state, tape, kind, 0) {
             i += 1;
             continue;
         }
@@ -506,7 +662,7 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
                     sets.push((offset, n));
                     i += 1;
                 }
-                set_cells(&mut out, &mut state, &sets, 0);
+                set_cells(&mut out, &mut state, tape, &sets, 0);
                 cleared = sets
                     .iter()
                     .filter(|&&(offset, _)| {
@@ -519,7 +675,27 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
 
             TokenKind::Move(n) => {
                 move_ptr(&mut out, n);
+                wrap_pointer(&mut out, tape);
                 state = State::default();
+            }
+
+            // With checked bounds: one cell per iteration, checked or wrapped.
+            TokenKind::Scan(step) if tape.checked() => {
+                let k = scans;
+                scans += 1;
+
+                test_cell(&mut out, &mut state, tape, 0);
+                instr(&mut out, &format!("je .scan_end_{k}"));
+                label(&mut out, &format!(".scan_{k}"));
+                move_ptr(&mut out, step);
+                wrap_pointer(&mut out, tape);
+                if tape.bounds == Bounds::Abort {
+                    check_range(&mut out, tape, 0, 0);
+                }
+                instr(&mut out, "cmp byte [rbx], 0");
+                instr(&mut out, &format!("jne .scan_{k}"));
+                label(&mut out, &format!(".scan_end_{k}"));
+                state = State::flags_from(0);
             }
 
             // Laid out like a loop, checking SCAN_UNROLL cells per iteration. The
@@ -529,7 +705,7 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
                 let k = scans;
                 scans += 1;
 
-                test_cell(&mut out, state.flags_cell, 0);
+                test_cell(&mut out, &mut state, tape, 0);
                 instr(&mut out, &format!("je .scan_end_{k}"));
                 label(&mut out, &format!(".scan_{k}"));
                 for ahead in 1..SCAN_UNROLL {
@@ -546,17 +722,18 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
                     instr(&mut out, &format!("lea rbx, [rbx{step:+}]"));
                 }
                 label(&mut out, &format!(".scan_end_{k}"));
-                state = State {
-                    flags_cell: Some(0),
-                    loaded: None,
-                };
+                state = State::flags_from(0);
             }
 
             TokenKind::JmpZ(n, offset) => {
                 let end = partner[i];
                 let resume_inside = resume_label && (i + 1..=end).contains(&resume.index);
 
-                if !resume_inside && let Some(step) = unrollable(&tokens[i + 1..end], offset) {
+                // Unrolling assumes every access is a plain offset from the pointer.
+                if !tape.checked()
+                    && !resume_inside
+                    && let Some(step) = unrollable(&tokens[i + 1..end], offset)
+                {
                     unrolled_loop(&mut out, &mut state, &tokens[i + 1..end], n, offset, step);
                     i = end + 1;
                     continue;
@@ -564,13 +741,10 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
 
                 // `[` checks on entry and `]` jumps back to the start of the body, so
                 // each iteration runs a single check.
-                test_cell(&mut out, state.flags_cell, offset);
+                test_cell(&mut out, &mut state, tape, offset);
                 instr(&mut out, &format!("je .end_{n}"));
                 label(&mut out, &format!(".loop_{n}"));
-                state = State {
-                    flags_cell: Some(offset),
-                    loaded: None,
-                };
+                state = State::flags_from(offset);
             }
             TokenKind::JmpNZ(n, offset) => {
                 // A `]` right after its cell was cleared never jumps back, so it needs
@@ -579,33 +753,45 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
                 if just_cleared.contains(&offset) {
                     state = State::default();
                 } else {
-                    test_cell(&mut out, state.flags_cell, offset);
+                    test_cell(&mut out, &mut state, tape, offset);
                     instr(&mut out, &format!("jne .loop_{n}"));
-                    state = State {
-                        flags_cell: Some(offset),
-                        loaded: None,
-                    };
+                    state = State::flags_from(offset);
                 }
                 label(&mut out, &format!(".end_{n}"));
             }
 
             TokenKind::Output(offset) => {
-                instr(&mut out, &format!("mov cl, {}", cell(offset)));
+                let address = address(&mut out, &mut state, tape, offset);
+                instr(&mut out, &format!("mov cl, byte [{address}]"));
                 instr(&mut out, "call putc");
-                state = State::default();
+                state.flags_cell = None;
+                state.loaded = None;
             }
 
             TokenKind::Input(offset) => {
                 instr(&mut out, "call flush");
 
-                // EOF (or a failed read) leaves the cell at 0.
-                instr(&mut out, &format!("mov {}, 0", cell(offset)));
+                // EOF (or a failed read) leaves the cell at 0. The address goes into
+                // `rsi` before `rdx` is used for the length.
+                let address = address(&mut out, &mut state, tape, offset);
+                instr(&mut out, &format!("mov byte [{address}], 0"));
                 instr(&mut out, "mov rax, 0");
                 instr(&mut out, "mov rdi, 0");
-                instr(&mut out, &format!("lea rsi, [rbx{offset:+}]"));
+                instr(&mut out, &format!("lea rsi, [{address}]"));
                 instr(&mut out, "mov rdx, 1");
                 instr(&mut out, "syscall");
-                state = State::default();
+                state.flags_cell = None;
+                state.loaded = None;
+            }
+
+            TokenKind::Check(min, max) => {
+                assert_eq!(
+                    tape.bounds,
+                    Bounds::Abort,
+                    "Check tokens are only made with --bounds abort"
+                );
+                check_range(&mut out, tape, min, max);
+                state.flags_cell = None;
             }
 
             TokenKind::Add(_) | TokenKind::AddAt(..) | TokenKind::MulAt(..) => {
@@ -624,6 +810,9 @@ pub fn generate(tokens: &[Token], start: &Evaluation) -> String {
     }
     if let Some((_, cells)) = used {
         data(&mut out, "tape_init", cells);
+    }
+    if tape.bounds == Bounds::Abort {
+        data(&mut out, "bounds_message", &bounds_message(tape));
     }
 
     out

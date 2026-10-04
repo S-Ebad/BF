@@ -1,7 +1,4 @@
-use crate::{
-    codegen::TAPE_LEN,
-    lexer::{Token, TokenKind},
-};
+use crate::lexer::{Token, TokenKind};
 
 /// How many steps -O3 runs a program for at compile time before giving up, unless
 /// `--step-limit` says otherwise. Even a program that never finishes only adds a
@@ -24,6 +21,7 @@ pub struct Resume {
     /// The pointer, as a cell index. It can be off the tape if the program moved
     /// there without touching a cell yet.
     pub pointer: isize,
+    /// The start of the tape, up to the last cell the program touched. The rest is 0.
     pub tape: Vec<u8>,
 }
 
@@ -35,22 +33,25 @@ impl Evaluation {
             resume: Some(Resume {
                 index: 0,
                 pointer: 0,
-                tape: vec![0; TAPE_LEN],
+                tape: Vec::new(),
             }),
         }
     }
 }
 
-/// -O3: runs the program at compile time for up to `step_limit` steps.
+/// -O3: runs the program at compile time for up to `step_limit` steps, on a tape of
+/// `tape_size` cells.
 ///
 /// Stops early at the first `,` (input isn't known yet), and before any op that
-/// would touch a cell off the tape (that's undefined, so it's left to the compiled
-/// program). If the program finishes, all that's left of it is its output.
-pub fn evaluate(tokens: &[Token], step_limit: u64) -> Evaluation {
+/// would touch a cell off the tape: depending on `--bounds` that's undefined, an
+/// error or wraps around, which is left to the compiled program. If the program
+/// finishes, all that's left of it is its output.
+pub fn evaluate(tokens: &[Token], step_limit: u64, tape_size: usize) -> Evaluation {
     use TokenKind::*;
 
     let partner = match_loops(tokens);
-    let mut tape = vec![0u8; TAPE_LEN];
+    // Only as long as the program has used so far, so a huge tape costs nothing here.
+    let mut tape: Vec<u8> = Vec::new();
     let mut pointer: isize = 0;
     let mut output = Vec::new();
     let mut index = 0;
@@ -60,8 +61,15 @@ pub fn evaluate(tokens: &[Token], step_limit: u64) -> Evaluation {
     let at = |pointer: isize, offset: isize| -> Option<usize> {
         usize::try_from(pointer + offset)
             .ok()
-            .filter(|&i| i < TAPE_LEN)
+            .filter(|&i| i < tape_size)
     };
+    // The cell at index `i` (on the tape), growing the used part to reach it.
+    fn cell(tape: &mut Vec<u8>, i: usize) -> &mut u8 {
+        if i >= tape.len() {
+            tape.resize(i + 1, 0);
+        }
+        &mut tape[i]
+    }
 
     'run: while index < tokens.len() {
         if steps >= step_limit {
@@ -72,34 +80,43 @@ pub fn evaluate(tokens: &[Token], step_limit: u64) -> Evaluation {
         match *tokens[index].kind() {
             Add(n) => {
                 let Some(i) = at(pointer, 0) else { break };
-                tape[i] = tape[i].wrapping_add(n);
+                let c = cell(&mut tape, i);
+                *c = c.wrapping_add(n);
             }
             AddAt(offset, n) => {
                 let Some(i) = at(pointer, offset) else { break };
-                tape[i] = tape[i].wrapping_add(n);
+                let c = cell(&mut tape, i);
+                *c = c.wrapping_add(n);
             }
             Move(n) => pointer += n,
             Set(offset, n) => {
                 let Some(i) = at(pointer, offset) else { break };
-                tape[i] = n;
+                *cell(&mut tape, i) = n;
             }
             MulAt(from, to, factor) => {
                 let Some(from) = at(pointer, from) else { break };
                 // With a 0 counter it adds nothing, wherever the target is. The loop
                 // it came from wouldn't have run, so the target can even be off the tape.
-                if tape[from] != 0 {
+                let counter = *cell(&mut tape, from);
+                if counter != 0 {
                     let Some(to) = at(pointer, to) else { break };
-                    tape[to] = tape[to].wrapping_add(tape[from].wrapping_mul(factor));
+                    let target = cell(&mut tape, to);
+                    *target = target.wrapping_add(counter.wrapping_mul(factor));
                 }
             }
             // Stopping partway through a scan is fine: resuming it carries on from
             // wherever the pointer got to.
             Scan(step) => loop {
                 let Some(i) = at(pointer, 0) else { break 'run };
-                if tape[i] == 0 {
+                if *cell(&mut tape, i) == 0 {
                     break;
                 }
                 if steps >= step_limit {
+                    break 'run;
+                }
+                // Don't step onto a cell off the tape: the compiled scan takes that
+                // step itself, which `--bounds abort` checks and `wrap` wraps.
+                if at(pointer + step, 0).is_none() {
                     break 'run;
                 }
                 steps += 1;
@@ -107,20 +124,26 @@ pub fn evaluate(tokens: &[Token], step_limit: u64) -> Evaluation {
             },
             Output(offset) => {
                 let Some(i) = at(pointer, offset) else { break };
-                output.push(tape[i]);
+                output.push(*cell(&mut tape, i));
             }
             Input(_) => break,
+            // A check that fails is left to the compiled program, which aborts.
+            Check(min, max) => {
+                if at(pointer, min).is_none() || at(pointer, max).is_none() {
+                    break;
+                }
+            }
             // Jumping to the partner and then stepping past it lands after `]` for
             // `[`, and at the start of the body for `]`.
             JmpZ(_, offset) => {
                 let Some(i) = at(pointer, offset) else { break };
-                if tape[i] == 0 {
+                if *cell(&mut tape, i) == 0 {
                     index = partner[index];
                 }
             }
             JmpNZ(_, offset) => {
                 let Some(i) = at(pointer, offset) else { break };
-                if tape[i] != 0 {
+                if *cell(&mut tape, i) != 0 {
                     index = partner[index];
                 }
             }

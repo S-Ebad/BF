@@ -8,7 +8,10 @@ fn optimized(src: &str, level: u8) -> Vec<TokenKind> {
     let mut tokens = tokenize(src);
     resolve_jumps(&mut tokens).unwrap_or_else(|_| panic!("unbalanced: {src:?}"));
 
-    optimize(tokens, level).iter().map(|t| *t.kind()).collect()
+    optimize(tokens, level, false)
+        .iter()
+        .map(|t| *t.kind())
+        .collect()
 }
 
 #[test]
@@ -84,7 +87,7 @@ fn other_ops_split_runs() {
 fn merged_token_keeps_first_span() {
     let mut tokens = tokenize("ab+++cd>>");
     resolve_jumps(&mut tokens).ok().unwrap();
-    let spans: Vec<Span> = optimize(tokens, 1).iter().map(Token::span).collect();
+    let spans: Vec<Span> = optimize(tokens, 1, false).iter().map(Token::span).collect();
 
     assert_eq!(spans, [Span::new(2), Span::new(7)]);
 }
@@ -401,4 +404,101 @@ fn live_loops_are_kept() {
         optimized("<[.]", 2),
         [JmpZ(0, -1), Output(-1), JmpNZ(0, -1), Move(-1)]
     );
+}
+
+#[test]
+fn multiply_loops_can_keep_their_guard() {
+    let mut tokens = tokenize(",[->+<]");
+    resolve_jumps(&mut tokens).ok().unwrap();
+    let kinds: Vec<TokenKind> = optimize(tokens, 2, true)
+        .iter()
+        .map(|t| *t.kind())
+        .collect();
+    assert_eq!(
+        kinds,
+        [Input(0), JmpZ(0, 0), MulAt(0, 1, 1), Set(0, 0), JmpNZ(0, 0)]
+    );
+}
+
+/// Tokens with `--bounds abort` checks, before and after optimizing at `level`.
+fn checked(src: &str, level: u8) -> Vec<TokenKind> {
+    let mut tokens = tokenize(src);
+    resolve_jumps(&mut tokens).unwrap_or_else(|_| panic!("unbalanced: {src:?}"));
+    let tokens = insert_access_checks(tokens);
+    optimize(tokens, level, true)
+        .iter()
+        .map(|t| *t.kind())
+        .collect()
+}
+
+#[test]
+fn checks_cover_the_cells_a_stretch_touches() {
+    // Cancelling accesses still count: the source as written touches cell -1.
+    assert_eq!(
+        checked("<+->", 0),
+        [Check(-1, -1), Move(-1), Add(1), Add(255), Move(1)]
+    );
+    // Moving off the tape without touching anything there isn't checked.
+    assert_eq!(
+        checked("<>++", 0),
+        [Check(0, 0), Move(-1), Move(1), Add(1), Add(1)]
+    );
+    // I/O and brackets end a stretch and touch their cell; moves after them only
+    // start a new stretch that touches nothing.
+    assert_eq!(
+        checked(">.<", 0),
+        [Check(1, 1), Move(1), Output(0), Move(-1)]
+    );
+    assert_eq!(
+        checked("[>+<-]", 0),
+        [
+            Check(0, 0),
+            JmpZ(0, 0),
+            Check(0, 1),
+            Move(1),
+            Add(1),
+            Move(-1),
+            Add(255),
+            JmpNZ(0, 0)
+        ]
+    );
+}
+
+#[test]
+fn checks_survive_optimizing() {
+    // `+-` cancels out, but the check for cell -1 stays.
+    assert_eq!(checked("<+-", 2), [Check(-1, -1), Move(-1)]);
+    assert_eq!(checked("<+->", 2), [Check(-1, -1)]);
+    // Folded moves shift the check with them.
+    assert_eq!(checked(">>+<<", 2), [Check(2, 2), AddAt(2, 1)]);
+}
+
+#[test]
+fn checks_stay_inside_multiply_guards() {
+    // Only a loop that runs touches its targets, so only then are they checked.
+    assert_eq!(
+        checked(",[->+<]", 2),
+        [
+            Check(0, 0),
+            Input(0),
+            Check(0, 0),
+            JmpZ(0, 0),
+            Check(0, 1),
+            MulAt(0, 1, 1),
+            Set(0, 0),
+            JmpNZ(0, 0)
+        ]
+    );
+    // A clear loop only touches its own cell, which its `[` already checked.
+    assert_eq!(
+        checked(",[-]", 2),
+        [Check(0, 0), Input(0), Check(0, 0), Set(0, 0)]
+    );
+}
+
+#[test]
+fn neighbouring_checks_merge() {
+    // The dead loop at the start goes, which leaves the check for its `[` right next
+    // to the check of the `<+` after it, at the same pointer.
+    assert_eq!(checked("[.]<+", 2), [Check(-1, 0), AddAt(-1, 1), Move(-1)]);
 }

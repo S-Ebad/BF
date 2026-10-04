@@ -1,4 +1,8 @@
-use crate::evaluator::DEFAULT_STEP_LIMIT;
+use crate::{
+    Options,
+    codegen::{DEFAULT_TAPE_SIZE, Tape},
+    evaluator::DEFAULT_STEP_LIMIT,
+};
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
@@ -25,6 +29,26 @@ pub struct Config {
     /// How many steps -O3 runs the program for at compile time before giving up
     #[arg(short, long, default_value_t = DEFAULT_STEP_LIMIT)]
     pub step_limit: u64,
+
+    /// Number of cells on the tape
+    #[arg(long, default_value_t = DEFAULT_TAPE_SIZE as u64,
+          value_parser = clap::value_parser!(u64).range(1..=i32::MAX as u64))]
+    pub tape_size: u64,
+
+    /// What happens when the program touches a cell outside the tape
+    #[arg(long, value_enum, default_value_t = Bounds::Undefined)]
+    pub bounds: Bounds,
+}
+
+/// What happens when the program touches a cell outside the tape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Bounds {
+    /// Not checked: it reads or writes whatever memory is there (fastest)
+    Undefined,
+    /// Stop with an error message and exit code 1
+    Abort,
+    /// The tape is circular: past the last cell is the first one, and the other way round
+    Wrap,
 }
 
 impl Config {
@@ -33,6 +57,18 @@ impl Config {
         self.output
             .clone()
             .unwrap_or_else(|| self.emit.default_output().into())
+    }
+
+    /// The settings `compile` needs.
+    pub fn options(&self) -> Options {
+        Options {
+            opt: self.opt,
+            step_limit: self.step_limit,
+            tape: Tape {
+                size: self.tape_size as usize,
+                bounds: self.bounds,
+            },
+        }
     }
 
     /// Reads the input file, with the path in the error.

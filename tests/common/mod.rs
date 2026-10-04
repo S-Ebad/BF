@@ -67,6 +67,107 @@ pub fn interpret(src: &str, input: &[u8], step_limit: u64) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// What happens when a program touches a cell outside the tape, as in `--bounds`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bounds {
+    Undefined,
+    Abort,
+    Wrap,
+}
+
+impl Bounds {
+    /// The value for `--bounds`.
+    pub fn flag(self) -> &'static str {
+        match self {
+            Bounds::Undefined => "undefined",
+            Bounds::Abort => "abort",
+            Bounds::Wrap => "wrap",
+        }
+    }
+}
+
+/// How a program run by `interpret_on` ends, with what it printed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Finished(Vec<u8>),
+    /// Touched a cell outside the tape with `Bounds::Abort`.
+    Aborted(Vec<u8>),
+}
+
+/// Reference interpreter on a tape of `tape_size` cells. Moving off the tape is
+/// fine; touching a cell there is what `bounds` is about.
+///
+/// Returns `None` if the program runs longer than `step_limit`, or touches a cell off
+/// the tape with `Bounds::Undefined`.
+pub fn interpret_on(
+    src: &str,
+    input: &[u8],
+    step_limit: u64,
+    tape_size: usize,
+    bounds: Bounds,
+) -> Option<Outcome> {
+    let code: Vec<u8> = src.bytes().filter(|b| b"+-<>.,[]".contains(b)).collect();
+
+    let mut jump = vec![0; code.len()];
+    let mut open = Vec::new();
+    for (i, &c) in code.iter().enumerate() {
+        match c {
+            b'[' => open.push(i),
+            b']' => {
+                let j = open.pop().expect("unbalanced program");
+                jump[i] = j;
+                jump[j] = i;
+            }
+            _ => (),
+        }
+    }
+    assert!(open.is_empty(), "unbalanced program");
+
+    let mut tape = vec![0u8; tape_size];
+    let mut input = input.iter();
+    let mut out = Vec::new();
+    let (mut ptr, mut ip, mut steps) = (0i64, 0usize, 0u64);
+    let size = tape_size as i64;
+
+    while ip < code.len() {
+        steps += 1;
+        if steps > step_limit {
+            return None;
+        }
+
+        let c = code[ip];
+        if c == b'>' || c == b'<' {
+            ptr += if c == b'>' { 1 } else { -1 };
+            ip += 1;
+            continue;
+        }
+
+        // Every other command touches the current cell.
+        let cell = if (0..size).contains(&ptr) {
+            ptr as usize
+        } else {
+            match bounds {
+                Bounds::Undefined => return None,
+                Bounds::Abort => return Some(Outcome::Aborted(out)),
+                Bounds::Wrap => ptr.rem_euclid(size) as usize,
+            }
+        };
+
+        match c {
+            b'+' => tape[cell] = tape[cell].wrapping_add(1),
+            b'-' => tape[cell] = tape[cell].wrapping_sub(1),
+            b'.' => out.push(tape[cell]),
+            b',' => tape[cell] = input.next().copied().unwrap_or(0),
+            b'[' if tape[cell] == 0 => ip = jump[ip],
+            b']' if tape[cell] != 0 => ip = jump[ip],
+            _ => (),
+        }
+        ip += 1;
+    }
+
+    Some(Outcome::Finished(out))
+}
+
 /// Deterministic PRNG (splitmix64) so fuzz failures are reproducible.
 pub struct Rng(u64);
 
@@ -137,15 +238,22 @@ impl Workspace {
 ///
 /// Panics with the compiler's stderr if compilation fails.
 pub fn build(ws: &Workspace, src: &str, opt: u8) -> PathBuf {
+    build_with(ws, src, opt, &[])
+}
+
+/// Like `build`, with extra arguments for the compiler.
+pub fn build_with(ws: &Workspace, src: &str, opt: u8, args: &[&str]) -> PathBuf {
     ws.write("prog.bf", src);
     let exe = ws.path(&format!("prog-O{opt}"));
 
-    let out = ws.brainfk([
-        "prog.bf".as_ref(),
-        "-o".as_ref(),
-        exe.as_os_str(),
-        format!("-O{opt}").as_ref(),
-    ]);
+    let mut all = vec![
+        "prog.bf".into(),
+        "-o".into(),
+        exe.clone().into_os_string(),
+        format!("-O{opt}").into(),
+    ];
+    all.extend(args.iter().map(Into::into));
+    let out = ws.brainfk(all);
     assert!(
         out.status.success(),
         "brainfk failed (is nasm installed?):\n{}",

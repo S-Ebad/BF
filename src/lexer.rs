@@ -19,6 +19,14 @@ pub enum TokenKind {
     ///
     /// `[>]` is `Scan(1)`, `[<<]` is `Scan(-2)`.
     Scan(isize),
+    /// `Check(min, max)`, only with `--bounds abort`: the source as written reads or
+    /// writes cells from offset `min` to `max` (and none further out) before the
+    /// next loop bracket or I/O. Aborts if either end is off the tape.
+    ///
+    /// Made before optimizing and never dropped by it, so a program that touches a
+    /// cell off the tape aborts at every level, even where the optimizer removed
+    /// the access itself (`<+-`).
+    Check(isize, isize),
     /// Print the cell at this offset (`.` is `Output(0)`).
     Output(isize),
     /// Read a byte into the cell at this offset (`,` is `Input(0)`).

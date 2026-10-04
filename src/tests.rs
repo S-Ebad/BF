@@ -1,5 +1,5 @@
 use super::compile;
-use crate::evaluator::DEFAULT_STEP_LIMIT;
+use crate::Options;
 
 // Errors come from resolving, which runs before any optimization, so -O0 covers them.
 use crate::errors::{
@@ -17,18 +17,18 @@ fn valid_programs_compile() {
         include_str!("../tests/bf/hello.bf"),
         include_str!("../tests/bf/squares.bf"),
     ] {
-        assert!(compile(src, 0, DEFAULT_STEP_LIMIT).is_ok(), "{src:?}");
+        assert!(compile(src, &Options::default()).is_ok(), "{src:?}");
     }
 }
 
 #[test]
 fn unmatched_open() {
     assert_eq!(
-        compile("[", 0, DEFAULT_STEP_LIMIT).unwrap_err(),
+        compile("[", &Options::default()).unwrap_err(),
         [Open(Span::new(0))]
     );
     assert_eq!(
-        compile("+[[]", 0, DEFAULT_STEP_LIMIT).unwrap_err(),
+        compile("+[[]", &Options::default()).unwrap_err(),
         [Open(Span::new(1))]
     );
 }
@@ -36,11 +36,11 @@ fn unmatched_open() {
 #[test]
 fn unmatched_close() {
     assert_eq!(
-        compile("]", 0, DEFAULT_STEP_LIMIT).unwrap_err(),
+        compile("]", &Options::default()).unwrap_err(),
         [Close(Span::new(0))]
     );
     assert_eq!(
-        compile("[]]", 0, DEFAULT_STEP_LIMIT).unwrap_err(),
+        compile("[]]", &Options::default()).unwrap_err(),
         [Close(Span::new(2))]
     );
 }
@@ -48,11 +48,11 @@ fn unmatched_close() {
 #[test]
 fn reports_every_error_in_source_order() {
     assert_eq!(
-        compile("][ ]]", 0, DEFAULT_STEP_LIMIT).unwrap_err(),
+        compile("][ ]]", &Options::default()).unwrap_err(),
         [Close(Span::new(0)), Close(Span::new(4))]
     );
     assert_eq!(
-        compile("abc\n\nx]y\n[[z", 0, DEFAULT_STEP_LIMIT).unwrap_err(),
+        compile("abc\n\nx]y\n[[z", &Options::default()).unwrap_err(),
         [Close(Span::new(6)), Open(Span::new(9)), Open(Span::new(10))]
     );
 }
@@ -60,11 +60,11 @@ fn reports_every_error_in_source_order() {
 #[test]
 fn spans_are_byte_offsets() {
     assert_eq!(
-        compile("ü]", 0, DEFAULT_STEP_LIMIT).unwrap_err(),
+        compile("ü]", &Options::default()).unwrap_err(),
         [Close(Span::new(2))]
     );
     assert_eq!(
-        compile("🚀[", 0, DEFAULT_STEP_LIMIT).unwrap_err(),
+        compile("🚀[", &Options::default()).unwrap_err(),
         [Open(Span::new(4))]
     );
 }
