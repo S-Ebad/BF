@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -263,8 +264,14 @@ pub fn build_with(ws: &Workspace, src: &str, opt: u8, args: &[&str]) -> PathBuf 
     exe
 }
 
-/// Runs an executable with the given stdin; stdin is fed from a thread so large
-/// input and output can't deadlock.
+/// How long `run` lets a program run before it counts as hanging.
+pub const RUN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Runs an executable with the given stdin; stdin is fed and stdout and stderr are
+/// read from threads, so large input and output can't deadlock.
+///
+/// Panics if the program is still running after `RUN_TIMEOUT`: a compiler bug that
+/// makes a program hang fails the test instead of hanging the test run.
 pub fn run(exe: &Path, input: &[u8]) -> Output {
     let mut child = Command::new(exe)
         .stdin(Stdio::piped())
@@ -279,10 +286,37 @@ pub fn run(exe: &Path, input: &[u8]) -> Output {
         // The program may exit without reading everything.
         let _ = stdin.write_all(&input);
     });
+    let read_all = |mut pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
+    };
+    let stdout = read_all(Box::new(child.stdout.take().unwrap()));
+    let stderr = read_all(Box::new(child.stderr.take().unwrap()));
 
-    let out = child.wait_with_output().unwrap();
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    let mut pause = Duration::from_millis(1);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{} still running after {RUN_TIMEOUT:?}", exe.display());
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(20));
+    };
+
     feeder.join().unwrap();
-    out
+    Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+    }
 }
 
 /// Compiles and runs `src` at every optimization level, asserting that each
